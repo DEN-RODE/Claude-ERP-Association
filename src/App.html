@@ -1,0 +1,2456 @@
+<script>
+(function () {
+  'use strict';
+
+  // ================= base =================
+  var S = { pin: '', view: 'accueil', param: null, data: {}, profil: 'gestion', fondPret: false };
+  window.ERP = S;   // état visible pour les tests automatisés, aucune donnée n'en sort
+
+  // ---- vocabulaire : les mots de la structure, envoyés avec le bootstrap ----
+  // Les identifiants internes restent stables (eleve, cours, stage) ; seuls les
+  // mots affichés changent. V('membres') -> "adhérents", "licenciés", "élèves"...
+  var VOC_DEFAUT = { membre: 'inscrit', membres: 'inscrits', cours: 'cours', coursPl: 'cours', stage: 'stage', stagePl: 'stages', lieu: 'sur place', activite: 'activité' };
+  var VOC = VOC_DEFAUT;
+  try { if (window.__INFO && window.__INFO.voc) VOC = Object.assign({}, VOC_DEFAUT, window.__INFO.voc); } catch (e) { }
+  function V(k) { return VOC[k] !== undefined ? VOC[k] : k; }
+  function Vmaj(k) { var t = V(k); return t ? t.charAt(0).toUpperCase() + t.slice(1) : t; }
+  window.ERP.V = V;
+
+  // seul réglage d'affichage gardé par le navigateur : aucune donnée personnelle n'est écrite sur disque
+  try { if (localStorage.getItem('erpProfil')) S.profil = localStorage.getItem('erpProfil'); } catch (e) { }
+  try { S.pin = localStorage.getItem('erp_pin') || ''; } catch (e) {}
+
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function $(sel, root) { return (root || document).querySelector(sel); }
+  function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  function eur(n) { var v = Number(n) || 0; return v.toLocaleString('fr-FR', { minimumFractionDigits: v % 1 ? 2 : 0, maximumFractionDigits: 2 }) + ' €'; }
+  function initials(e) { return (String(e.prenom || '?')[0] + String(e.nom || ' ')[0]).trim().toUpperCase(); }
+  // liens venant des Sheets : uniquement http(s)
+  function safeUrl(u) { u = String(u || '').trim(); return /^https?:\/\//i.test(u) ? u : '#'; }
+  function safeImg(d) { return /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+\/=]+$/.test(String(d || '')) ? d : ''; }
+  function todayIso() { var d = new Date(); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+  function frToIso(s) { var m = String(s || '').match(/^(\d{2})\/(\d{2})\/(\d{4})/); return m ? m[3] + '-' + m[2] + '-' + m[1] : String(s || ''); }
+  // extrait les numéros (FR 0x xx xx xx xx, +33 / +41, 0041...) même collés les uns aux autres
+  function phones(txt) {
+    var out = [], re = /\+?\d[\d .\-\/]{7,}\d/g, m;
+    while ((m = re.exec(String(txt || '')))) {
+      var s = m[0].replace(/[ .\-\/]/g, '');
+      while (s.length >= 9) {
+        var n = s[0] === '+' ? 12 : (s.indexOf('00') === 0 ? 13 : (s[0] === '0' ? 10 : (/^(33|41)/.test(s) ? 11 : s.length)));
+        out.push(s.slice(0, n)); s = s.slice(n);
+      }
+    }
+    return out;
+  }
+  function fmtTel(p) { return /^0\d{9}$/.test(p) ? p.replace(/(\d{2})(?=\d)/g, '$1 ') : p; }
+  function telLinks(txt) {
+    return phones(txt).map(function (p) {
+      return '<a class="tel" href="tel:' + esc(p) + '">' + ICON.phone + esc(fmtTel(p)) + '</a>';
+    }).join('');
+  }
+
+  // erreurs Google traduites (le cas classique : plusieurs comptes Google ouverts dans Chrome)
+  function msgErreur(e) {
+    var m = String(e && e.message || e || '');
+    if (/403|PERMISSION|autoris|authoriz|NetworkError|storage|sign ?in|connexion/i.test(m))
+      return 'Google bloque l\'accès : plusieurs comptes Google sont sans doute ouverts dans ce navigateur. Ouvre l\'ERP dans une fenêtre de navigation privée (ou un profil Chrome) avec un seul compte, ou déconnecte les autres comptes.';
+    return m || 'Erreur inconnue';
+  }
+  function call(action, payload) {
+    S.nCalls = (S.nCalls || 0) + 1;   // compteur d'allers-retours serveur, lu par les tests
+    return new Promise(function (resolve, reject) {
+      if (!window.google || !google.script) return reject(new Error('Hors Apps Script'));
+      google.script.run
+        .withSuccessHandler(function (raw) {
+          var r;
+          try { r = JSON.parse(raw); } catch (e) { return reject(new Error('Réponse illisible')); }
+          if (r.ok) { if (!LECTURES[action]) apresEcriture(action); return resolve(r.data); }
+          if (r.error === 'PIN' || r.error === 'LOCK') { showPin(r.message); return reject(new Error(r.message)); }
+          if (r.error === 'NOPIN') { noPin(r.message); return reject(new Error(r.message)); }
+          reject(new Error(r.message || 'Erreur'));
+        })
+        .withFailureHandler(function (e) { reject(new Error(msgErreur(e))); })
+        .api(action, payload || {}, S.pin);
+    });
+  }
+
+  // ---------- cache (mémoire du navigateur, jamais sur disque : données santé) ----------
+  // Tout est chargé à la connexion (barre de chargement). Ensuite les pages s'affichent depuis le cache,
+  // sans attendre le serveur. On ne recharge que : ce qu'une modification touche (en arrière-plan),
+  // tout toutes les 30 min (en arrière-plan), ou tout sur le bouton Actualiser.
+  var PAGES = {};
+  var FRAIS = 30 * 60 * 1000;
+  var LECTURES = { achats: 1, intervenants: 1, facturesInterv: 1, propositionFacture: 1, remunerations: 1, attente: 1, mailVoir: 1, dossierDevis: 1, mediasDossiers: 1, urgencesTous: 1, brouillonVoir: 1, info: 1, ping: 1, accueil: 1, cours: 1, stages: 1, recherche: 1, eleve: 1, champs: 1, urgencesGroupe: 1, compta: 1, factures: 1, apercuMail: 1, aRelancer: 1, mails: 1, rappels: 1, notesSite: 1, agenda: 1, medias: 1, miniature: 1, texteDoc: 1, docs: 1, rapports: 1, groupes: 1, appel: 1, appelsTous: 1 };
+  var ELEVES = ['cours', 'stages', 'accueil', 'urgencesTous', 'aRelancer'];
+  // ce que chaque modification rend périmé (rechargé en arrière-plan, rien d'autre)
+  var DEPS = {
+    suivi: ELEVES.concat(['compta', 'appel*']), ajouterInscription: ELEVES.concat(['appel*']), modifierInscription: ELEVES, rattacherCours: ELEVES.concat(['appel*']), supprimerInscription: ELEVES.concat(['appel*']),
+    deplacer: ELEVES.concat(['appel*']), brouillon: ['mails', 'aRelancer'], envoyerMail: ['aRelancer', 'accueil'], brouillonsRelance: ['mails', 'aRelancer', 'accueil'], noterRelance: ['aRelancer', 'accueil'],
+    brouillonEnvoyer: ['mails', 'accueil'], mailsAction: ['mails', 'accueil'], uploadMedia: [], brouillonModifier: ['mails'], brouillonSupprimer: ['mails', 'accueil'],
+    ajouterDepense: ['compta'], ajouterRecette: ['compta'], saveAchat: ['achats', 'compta'], payerAchat: ['achats', 'compta', 'factures'], supprimerAchat: ['achats'],
+    saveRemuneration: ['remunerations', 'compta', 'achats'], saveIntervenant: ['intervenants'], reinitNumInterv: ['intervenants'], conventionCollective: [], creerFactureInterv: ['facturesInterv', 'intervenants', 'achats', 'compta'], envoyerFactureInterv: ['facturesInterv'], supprimerFactureInterv: ['facturesInterv', 'achats'], supprimerLigneCompta: ['compta'], modifierCaisse: ['compta'], modifierLigneCompta: ['compta'], uploadJustificatif: [],
+    creerFacture: ['factures', 'compta'], statutFacture: ['factures', 'compta'], saveRappel: ['rappels', 'accueil'], deleteRappel: ['rappels', 'accueil'],
+    saveNoteSite: ['notesSite'], statutNoteSite: ['notesSite'], deleteNoteSite: ['notesSite'], creerEvenement: ['agenda', 'accueil'], rafraichirMedias: [], saveAppel: [], syncModeleEco: ['compta'], saveAttente: ['cours', 'stages', 'attente'], statutAttente: ['cours', 'stages', 'attente'], supprimerAttente: ['cours', 'stages', 'attente'], reglagesGroupe: ['cours', 'stages', 'accueil']
+  };
+  var REQ = { agenda: { jours: 21 } };
+  var RENDU = {};   // clé -> page affichée qui l'utilise (pour la remettre à jour si les données changent)
+  function appelCle(key) { var x = key.split('|'); return { source: x[1], cle: x.slice(2).join('|') }; }
+  // Une demande déjà en route n'est pas relancée : Apps Script traite les appels d'un même
+  // utilisateur à la file, donc deux demandes identiques doublent l'attente au lieu de la partager.
+  // Cas typique : le préchargement de la fiche d'appel et le clic sur « Faire l'appel ».
+  var ENCOURS = {};
+  function charger(key, payload) {
+    if (ENCOURS[key]) return ENCOURS[key];
+    var pr = key.indexOf('appel|') === 0 ? call('appel', appelCle(key)) : call(key, payload || REQ[key] || {});
+    var job = pr.then(function (d) { return ranger(key, d); });
+    ENCOURS[key] = job;
+    job.then(function () { delete ENCOURS[key]; }, function () { delete ENCOURS[key]; });
+    return job;
+  }
+  function ranger(key, d) {
+    var js = JSON.stringify(d), avant = PAGES[key];
+    PAGES[key] = { data: d, js: js, t: Date.now() };
+    if (avant && avant.js !== js) redessiner(key);
+    return d;
+  }
+  function redessiner(key) {
+    var r = RENDU[key];
+    if (!r || r.gen !== S.gen) return;
+    var ae = document.activeElement;
+    if (ae && ae.closest && ae.closest('#view') && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) return; // on ne casse pas une saisie
+    try { r.fn(); } catch (e) { }
+  }
+  /**
+   * Plusieurs lectures en UN aller-retour serveur (action « bloc »).
+   * Apps Script traite les appels d'un même utilisateur à la file : seize appels lancés
+   * ensemble s'empilent côté serveur. Les regrouper supprime quinze latences réseau.
+   * Les fiches d'appel gardent leur appel propre (chacune a son paramètre).
+   */
+  function chargerBloc(keys) {
+    keys = keys.filter(function (k, i) { return keys.indexOf(k) === i; });
+    var seuls = keys.filter(function (k) { return k.indexOf('appel|') === 0; });
+    var group = keys.filter(function (k) { return k.indexOf('appel|') !== 0; });
+    var err = null, garde = function (e) { if (!err) err = e; };
+    var jobs = seuls.map(function (k) { return charger(k).catch(garde); });
+    if (group.length === 1) jobs.push(charger(group[0]).catch(garde));
+    else if (group.length) {
+      var params = {};
+      group.forEach(function (k) { if (REQ[k]) params[k] = REQ[k]; });
+      jobs.push(call('bloc', { actions: group, params: params }).then(function (r) {
+        group.forEach(function (k) {
+          if (r && r[k] && r[k].err === undefined) ranger(k, r[k].v);
+          else if (r && r[k]) garde(new Error(r[k].err));
+        });
+      }).catch(garde));
+    }
+    return Promise.all(jobs).then(function () {
+      var ko = keys.filter(function (k) { return !PAGES[k]; });
+      if (ko.length) throw (err || new Error('Lecture impossible : ' + ko.join(', ')));
+    });
+  }
+  function rafraichir(keys) {
+    return chargerBloc(keys).catch(function () { });
+  }
+  function apresEcriture(action) {
+    var deps = DEPS[action];
+    if (deps === undefined) { Object.keys(PAGES).forEach(function (k) { PAGES[k].t = 0; }); return; }
+    var keys = [];
+    deps.forEach(function (k) {
+      if (k === 'appel*') Object.keys(PAGES).forEach(function (x) { if (x.indexOf('appel|') === 0) keys.push(x); });
+      else if (PAGES[k]) keys.push(k);
+    });
+    setTimeout(function () { rafraichir(keys); }, 0);
+  }
+  // page qui lit une ou plusieurs clés : affichage immédiat si en cache, sinon chargement
+  function swrN(keys, render) {
+    var gen = S.gen;
+    function draw() { render(keys.map(function (k) { return PAGES[k].data; })); }
+    keys.forEach(function (k) { RENDU[k] = { gen: gen, fn: function () { if (keys.every(function (x) { return PAGES[x]; })) draw(); } }; });
+    var manquent = keys.filter(function (k) { return !PAGES[k]; });
+    if (!manquent.length) {
+      draw();
+      var vieux = keys.filter(function (k) { return Date.now() - PAGES[k].t > FRAIS; });
+      if (vieux.length) rafraichir(vieux);
+      return Promise.resolve();
+    }
+    return chargerBloc(manquent).then(function () { if (S.gen === gen) draw(); });
+  }
+  function swr(key, render) { return swrN([key], function (d) { render(d[0]); }); }
+
+  // Chargement a la connexion.
+  // Cote serveur, chaque lecture est en cache et un declencheur la recalcule toutes les
+  // 10 min : l'ERP ne fait plus que lire des reponses deja pretes. On peut donc tout
+  // demander d'un coup, en deux allers-retours seulement, et tous les ecrans sont immediats.
+  var ESSENTIEL = ['accueil', 'cours', 'stages', 'urgencesTous', 'agenda', 'rappels', 'notesSite'];
+  var FOND = {
+    piste: ['appelsTous*'],
+    gestion: ['compta', 'achats', 'remunerations', 'factures', 'intervenants', 'facturesInterv',
+      'mails', 'aRelancer', 'docs', 'appelsTous*']
+  };
+  function chargerTout(fresh) {
+    var box = $('#bootLoad'), bar = $('#bootBar'), txt = $('#bootTxt');
+    box.hidden = false;
+    var etapes = [['Connexion', 4], [Vmaj('membres') + ', ' + V('coursPl') + ' et ' + V('stagePl'), 65], ['Prêt', 100]];
+    function etape(i) { bar.style.width = etapes[i][1] + '%'; txt.textContent = etapes[i][0] + (i ? ' ✓' : '…'); }
+    etape(0);
+    var debut = fresh ? call('ping', { fresh: true }).catch(function () { }) : Promise.resolve();
+    var fin = debut.then(function () { return chargerBloc(ESSENTIEL).catch(function () { }); }).then(function () { etape(1); });
+    var maxi = new Promise(function (r) { setTimeout(r, 40000); });
+    return Promise.race([fin, maxi]).then(function () {
+      etape(2); box.hidden = true;
+      setTimeout(function () { chargerFond(); }, 120);
+    });
+  }
+  /** Le reste, juste apres l'affichage : l'ERP est deja utilisable pendant ce temps. */
+  function chargerFond() {
+    S.fondPret = false;
+    var l = (FOND[profil()] || []).slice();
+    var appels = l.indexOf('appelsTous*') >= 0;
+    l = l.filter(function (k) { return k !== 'appelsTous*'; });
+    var p = l.length ? rafraichir(l) : Promise.resolve();
+    // toutes les fiches d'appel, cours ET stages, pour que l'appel s'ouvre sans attendre
+    if (appels) p = p.then(function () {
+      return call('appelsTous').then(function (all) {
+        Object.keys(all || {}).forEach(function (k) { ranger('appel|' + k, all[k]); });
+      }).catch(function () { });
+    });
+    return p.then(function () { S.fondPret = true; });
+  }
+  setInterval(function () { if (S.pin && document.visibilityState !== 'hidden') rafraichir(Object.keys(PAGES)); }, FRAIS);
+  function prechargerAppel(src, cle) {
+    var k = 'appel|' + src + '|' + cle;
+    if (PAGES[k]) return;
+    charger(k).catch(function () { });
+  }
+
+  var toastT;
+  function toast(msg, err) {
+    var t = $('#toast');
+    t.textContent = msg; t.className = 'toast show' + (err ? ' err' : '');
+    clearTimeout(toastT); toastT = setTimeout(function () { t.className = 'toast'; }, err ? 5000 : 2600);
+  }
+  function fail(e) { toast(e && e.message ? e.message : String(e), true); }
+
+  function busy(btn, on) { if (btn) { btn.disabled = on; if (on) { btn.dataset.txt = btn.innerHTML; btn.innerHTML = '…'; } else if (btn.dataset.txt) btn.innerHTML = btn.dataset.txt; } }
+
+  // ================= icônes =================
+  function svg(p) { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + p + '</svg>'; }
+  var ICON = {
+    home: svg('<path d="M3 11 12 4l9 7"/><path d="M5 10v10h14V10"/>'),
+    cours: svg('<path d="M12 3 2 20h20Z"/><path d="M12 3v17"/>'),
+    stage: svg('<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>'),
+    urg: svg('<path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z"/><path d="M12 8v5M12 16h.01"/>'),
+    compta: svg('<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>'),
+    facture: svg('<path d="M6 2h9l5 5v15H6Z"/><path d="M14 2v6h6M9 13h7M9 17h7"/>'),
+    agenda: svg('<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4M8 13h3"/>'),
+    mail: svg('<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>'),
+    comm: svg('<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/>'),
+    site: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
+    docs: svg('<path d="M3 7h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>'),
+    more: svg('<circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/>'),
+    phone: svg('<path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2"/>'),
+    plus: svg('<path d="M12 5v14M5 12h14"/>'),
+    back: svg('<path d="m15 18-6-6 6-6"/>'),
+    ext: svg('<path d="M14 4h6v6M20 4 10 14M19 14v6H4V5h6"/>'),
+    search: svg('<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>'),
+    check: svg('<rect x="3" y="3" width="18" height="18" rx="3"/><path d="m8 12 3 3 5-6"/>'),
+    refresh: svg('<path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"/>')
+  };
+
+  var NAV = [
+    { id: 'accueil', label: 'Accueil', ic: 'home' },
+    { id: 'cours', label: 'Cours annuels', short: 'Cours', ic: 'cours' },
+    { id: 'stages', label: 'Stages', ic: 'stage' },
+    { id: 'urgences', label: 'Infos urgentes', short: 'Urgences', ic: 'urg' },
+    { id: 'compta', label: 'Compta', ic: 'compta' },
+    { id: 'factures', label: 'Devis & factures', short: 'Factures', ic: 'facture' },
+    { id: 'facturation', label: 'Ma facturation', short: 'Ma facture', ic: 'facture' },
+    { id: 'agenda', label: 'Agenda & rappels', ic: 'agenda' },
+    { id: 'mails', label: 'Mails & relances', ic: 'mail' },
+    { id: 'site', label: 'Notes site web', ic: 'site' },
+    { id: 'docs', label: 'Docs & rapports', ic: 'docs' }
+  ];
+  var BOTTOM = ['accueil', 'cours', 'stages', 'urgences'];
+
+  // Deux profils. « Piste » ne charge que ce qui sert sur le terrain, donc l'ERP s'ouvre
+  // plus vite et le menu est plus court. « Gestion » voit tout.
+  var PROFILS = {
+    piste: { label: 'Piste', aide: 'Accueil, cours, stages, urgences, agenda', vues: ['accueil', 'cours', 'stages', 'urgences', 'agenda', 'site'] },
+    gestion: { label: 'Gestion', aide: 'Tout l\'ERP, compta comprise', vues: null }
+  };
+  function profil() { return PROFILS[S.profil] ? S.profil : 'gestion'; }
+  function navVisible() {
+    var v = PROFILS[profil()].vues;
+    return v ? NAV.filter(function (n) { return v.indexOf(n.id) >= 0; }) : NAV;
+  }
+  function setProfil(p) {
+    S.profil = PROFILS[p] ? p : 'gestion';
+    try { localStorage.setItem('erpProfil', S.profil); } catch (e) { }
+    var vis = navVisible().map(function (n) { return n.id; });
+    renderNav();
+    go(vis.indexOf(S.view) >= 0 ? S.view : 'accueil');
+  }
+  function renderNav() {
+    var vis = navVisible();
+    $('#sideNav').innerHTML = vis.map(function (n) {
+      return '<button class="nav-item' + (S.view === n.id ? ' on' : '') + '" data-go="' + n.id + '"><span class="ic">' + ICON[n.ic] + '</span>' + esc(n.label) + '</button>';
+    }).join('') +
+      '<div class="profil"><span class="muted small">Mode</span>' + Object.keys(PROFILS).map(function (p) {
+        return '<button class="chip' + (profil() === p ? ' on' : '') + '" data-act="profil" data-p="' + p + '" title="' + esc(PROFILS[p].aide) + '">' + esc(PROFILS[p].label) + '</button>';
+      }).join('') + '</div>';
+    var bas = BOTTOM.filter(function (id) { return vis.some(function (n) { return n.id === id; }); });
+    $('#bottomNav').innerHTML = bas.map(function (id) {
+      var n = NAV.filter(function (x) { return x.id === id; })[0];
+      return '<button class="' + (S.view === id ? 'on' : '') + '" data-go="' + id + '"><span class="ic">' + ICON[n.ic] + '</span>' + esc(n.short || n.label) + '</button>';
+    }).join('') + '<button class="' + (bas.indexOf(S.view) < 0 ? 'on' : '') + '" data-act="menu"><span class="ic">' + ICON.more + '</span>Plus</button>';
+  }
+
+  function go(view, param) {
+    S.view = view; S.param = param || null; S.gen = (S.gen || 0) + 1;
+    renderNav();
+    closeDrawer();
+    var el = $('#view');
+    el.innerHTML = '<div class="loader"><span></span></div>';
+    window.scrollTo(0, 0);
+    var fn = VIEWS[view];
+    Promise.resolve().then(function () { return fn(el, param); }).catch(function (e) {
+      el.innerHTML = '<div class="empty"><b>Oups.</b><br>' + esc(e.message || e) + '<br><br><button class="btn" data-go="' + esc(view) + '">Réessayer</button></div>';
+    });
+  }
+
+  // ================= drawer =================
+  function openDrawer(title, html) {
+    $('#drawerTitle').textContent = title;
+    $('#drawerBody').innerHTML = html;
+    $('#drawer').classList.add('open');
+    $('#drawer').setAttribute('aria-hidden', 'false');
+  }
+  function drawerBody(html) { $('#drawerBody').innerHTML = html; }
+  function closeDrawer() { S.attentePrefill = null; $('#drawer').classList.remove('open'); $('#drawer').setAttribute('aria-hidden', 'true'); }
+
+  var ACT = {};
+  ACT.profil = function (t) { setProfil(t.dataset.p); };
+  // relit tout depuis les Sheets (utile après une modif faite à la main dans un Sheet : case verte...)
+  ACT.refresh = function () {
+    closeDrawer();
+    chargerTout(true).then(function () { go(S.view, S.param); toast('À jour'); });
+  };
+
+  // ================= PIN =================
+  function forgetPin() { S.pin = ''; try { localStorage.removeItem('erp_pin'); } catch (e) {} }
+  function showPin(msg) {
+    forgetPin();
+    $('#pinScreen').hidden = false;
+    $('#pinErr').textContent = msg || '';
+    $('#pinInput').value = '';
+    setTimeout(function () { $('#pinInput').focus(); }, 50);
+  }
+  function noPin(msg) {
+    $('#pinScreen').hidden = false;
+    $('#pinForm').innerHTML = (S.logo ? '<img class="logo big" alt="" src="' + S.logo + '">' : '<span class="brand-dot big"></span>') + '<h1>Presque prêt</h1><p>' + esc(msg) + '</p>';
+  }
+  $('#pinForm').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var btn = $('#pinForm button');
+    S.pin = $('#pinInput').value;
+    busy(btn, true);
+    call('ping').then(function () {
+      busy(btn, false);
+      try { localStorage.setItem('erp_pin', S.pin); } catch (e) {}   // mémorisé seulement si le code est bon
+      $('#pinScreen').hidden = true;
+      chargerTout().then(function () { if ($('#pinScreen').hidden) go(S.view, S.param); });
+    }).catch(function () { busy(btn, false); });
+  });
+  ACT.lock = function () { forgetPin(); closeDrawer(); $('#view').innerHTML = ''; showPin(''); };
+
+  // ================= délégation d'événements =================
+  document.addEventListener('click', function (ev) {
+    var t = ev.target.closest('[data-go],[data-act],[data-close]');
+    if (!t) return;
+    if (t.hasAttribute('data-close')) { closeDrawer(); return; }
+    if (t.dataset.go) { ev.preventDefault(); go(t.dataset.go, t.dataset.param ? JSON.parse(t.dataset.param) : null); return; }
+    var a = ACT[t.dataset.act];
+    if (a) { ev.preventDefault(); a(t, ev); }
+  });
+  document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') closeDrawer(); });
+  $('#btnSearchTop').addEventListener('click', function () { go('urgences'); });
+
+  ACT.menu = function () {
+    openDrawer('Menu', '<div class="sheet-menu">' + NAV.filter(function (n) { return BOTTOM.indexOf(n.id) < 0; }).map(function (n) {
+      return '<button data-go="' + n.id + '"><span class="ic">' + ICON[n.ic] + '</span>' + esc(n.short || n.label) + '</button>';
+    }).join('') + '</div><div class="hr"></div><button class="btn" style="width:100%" data-act="lock">Verrouiller l\'ERP</button>');
+  };
+
+  function P(obj) { return esc(JSON.stringify(obj)); }
+
+  // ================= composants =================
+  function eleveItem(e, extra) {
+    var badges = [];
+    if (e.alerteSante) badges.push('<span class="b red">Santé</span>');
+    if (e.signale) badges.push('<span class="b red" title="Case en rouge dans le Sheet">Signalé</span>');
+    if (e.paye === 'Oui') badges.push('<span class="b green">Payé</span>');
+    else if (e.paye === 'Partiel') badges.push('<span class="b yellow">Partiel</span>');
+    else badges.push('<span class="b">Paiement ?</span>');
+    if (e.manquants && e.manquants.length) badges.push('<span class="b yellow" title="' + esc(e.manquants.join(', ')) + '">Infos manquantes</span>');
+    if (e.statut === 'Désinscrit') badges.push('<span class="b dark">Désinscrit</span>');
+    var sub = [e.age !== '' ? e.age + ' ans' : '', e.responsable, e.tel].filter(Boolean).join(' · ');
+    return '<div class="li click" data-act="eleve" data-src="' + esc(e.source) + '" data-id="' + esc(e.id) + '">' +
+      '<span class="avatar' + (e.alerteSante ? ' alert' : '') + '">' + esc(initials(e)) + '</span>' +
+      '<div class="main"><div class="t">' + esc(e.prenom + ' ' + e.nom) + '</div><div class="s">' + esc(sub || extra || '') + '</div></div>' +
+      '<div class="row" style="gap:4px;justify-content:flex-end">' + badges.join('') + '</div></div>';
+  }
+
+  function urgCard(e) {
+    var sante = [];
+    if (e.allergies && !isRas(e.allergies)) sante.push('<dt>Allergies</dt><dd class="health">' + esc(e.allergies) + '</dd>');
+    if (e.sante && !isRas(e.sante)) sante.push('<dt>Santé / PAI</dt><dd class="health">' + esc(e.sante) + '</dd>');
+    return '<div class="card urg' + (e.alerteSante ? ' alert' : '') + '">' +
+      '<div class="row" style="justify-content:space-between;align-items:center"><div><div class="name">' + esc(e.prenom + ' ' + e.nom) + '</div>' +
+      '<div class="muted small">' + esc([e.age !== '' ? e.age + ' ans' : '', e.creneaux || e.stage].filter(Boolean).join(' · ')) + '</div></div>' +
+      (e.alerteSante ? '<span class="b red">Alerte santé</span>' : '<span class="b green">RAS santé</span>') + '</div>' +
+      '<dl>' + sante.join('') +
+      '<dt>À prévenir</dt><dd>' + esc(e.urgence || 'non renseigné') + '</dd>' +
+      '<dt>Responsable</dt><dd>' + esc(e.responsable || '') + '</dd>' +
+      (e.second ? '<dt>2e contact</dt><dd>' + esc(e.second) + '</dd>' : '') +
+      '<dt>Repart seul</dt><dd>' + esc(e.repartSeul || '?') + '</dd>' +
+      (e.autorises ? '<dt>Autorisés</dt><dd>' + esc(e.autorises) + '</dd>' : '') +
+      '<dt>Soins</dt><dd>' + esc(e.soins || 'non renseigné') + '</dd>' +
+      '</dl><div>' + telLinks([e.urgence, e.tel, e.second].join(' ')) + '</div>' +
+      '<div style="margin-top:10px"><button class="btn sm" data-act="eleve" data-src="' + esc(e.source) + '" data-id="' + esc(e.id) + '">Fiche complète</button></div></div>';
+  }
+
+  var RAS = ['', 'non', 'ras', 'r.a.s', 'na', 'n/a', 'nan', 'aucun', 'aucune', 'rien', 'neant', '-', '/', 'no', 'none', 'x', '0'];
+  function isRas(v) {
+    var n = String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim().replace(/[.!]+$/, '');
+    return RAS.indexOf(n) >= 0;
+  }
+
+  function barHtml(n, max) {
+    var pct = Math.min(100, Math.round((n / (max || 1)) * 100));
+    return '<div class="bar' + (n >= max ? ' full' : (pct < 34 ? ' low' : '')) + '"><i style="width:' + pct + '%"></i></div>';
+  }
+  function grp(g) { return g === 'matin' ? 'Matin' : (g === 'apres-midi' ? 'Après-midi' : g); }
+  function statutBadge(s) {
+    var cls = { 'Complet': 'red', 'Ouvert': 'green', 'Confirmé': 'green', 'Sous le minimum': 'yellow', 'Sous le seuil': 'yellow', 'Aucun inscrit': '' }[s] || '';
+    return '<span class="b ' + cls + '">' + esc(s) + '</span>';
+  }
+
+  // ================= VUES =================
+  var VIEWS = {};
+
+  // ---------- Accueil ----------
+  var accueilView = function (el) {
+    return swr('accueil', function (d) {
+      var s = d.stats;
+      var h = '<div class="page-head"><div><h1>' + esc(d.jour) + ' ' + esc(d.date) + '</h1><p>Tout ce qu\'il faut voir aujourd\'hui</p></div>' +
+        '<div class="actions"><button class="btn" data-act="newRappel">' + ICON.plus + 'Rappel</button><button class="btn primary" data-go="urgences">' + ICON.urg + 'Infos urgentes</button></div></div>';
+      h += '<div class="grid g4">' +
+        kpi(s.eleves, V('membres') + ' ' + V('coursPl') + ' annuels', '', 'eleves', { src: 'cours' }) + kpi(s.stagiaires, 'inscrits en ' + V('stage'), '', 'eleves', { src: 'stages' }) +
+        kpi(s.impayes, 'paiements non notés', s.impayes ? 'red' : '', 'mails') + kpi(s.aRelancer, 'à relancer', s.aRelancer ? 'warn' : '', 'mails') +
+        '</div><div class="grid g4" style="margin-top:14px">' +
+        kpi(s.nonLus, 'mails non lus', '', 'mails') + kpi(s.brouillons, 'brouillons Gmail à valider', s.brouillons ? 'warn' : '', 'mails') +
+        kpi(s.alertes, 'enfants avec alerte santé', '', 'urgences') + kpi(s.nonClasses, 'inscriptions non classées', s.nonClasses ? 'warn' : '', 'cours') + '</div>';
+
+      h += '<div class="grid g2 section" style="align-items:start"><div>';
+      h += '<div class="section" style="margin-top:0"><h2>Cours aujourd\'hui</h2>';
+      if (!d.coursDuJour.length) h += '<div class="empty">Pas de cours annuel aujourd\'hui.</div>';
+      else h += '<div class="grid">' + d.coursDuJour.map(function (k) {
+        return '<div class="card"><div class="row" style="justify-content:space-between;align-items:center"><div><span class="b heure" style="background:var(--blue);color:#fff;border-color:var(--blue)">' + esc(k.horaire) + '</span> <span class="muted">' + esc(k.libelle) + '</span></div>' +
+          (k.alertes ? '<span class="b red">' + k.alertes + ' alerte' + (k.alertes > 1 ? 's' : '') + ' santé</span>' : '') + '</div>' +
+          '<p class="muted small" style="margin:6px 0 10px">' + k.inscrits + ' ' + V('membres') + '</p>' +
+          '<div class="actions"><button class="btn sm primary" data-act="appel" data-src="cours" data-cle="' + esc(k.cle) + '">' + ICON.check + 'Appel</button><button class="btn sm dark" data-act="urgGroupe" data-src="cours" data-cle="' + esc(k.cle) + '">' + ICON.urg + 'Mode piste</button>' +
+          '<button class="btn sm" data-go="cours" data-param="' + P({ cle: k.cle }) + '">Liste</button></div></div>';
+      }).join('') + '</div>';
+      h += '</div>';
+
+      h += '<div class="section"><h2>Rappels</h2><div class="card">' + (d.rappels.length ? '<div class="list">' + d.rappels.map(rappelItem).join('') + '</div>' : '<div class="muted">Rien d\'urgent. <a href="#" data-go="agenda">Voir tous les rappels</a></div>') + '</div></div>';
+
+      if (d.coursFragiles.length) h += '<div class="section"><h2>Cours sous le minimum</h2><div class="card small">' + d.coursFragiles.map(esc).join(' · ') + '</div></div>';
+      h += '</div><div>';
+
+      h += '<div class="section" style="margin-top:0"><h2>Agenda 3 jours</h2><div class="card">' + (d.agenda.length ? '<div class="list">' + d.agenda.map(function (ev) {
+        var st = ev.couleur ? ' style="background:' + esc(ev.couleur) + ';color:#fff;border-color:' + esc(ev.couleur) + '"' : '';
+        return '<div class="li"><span class="b heure' + (ev.couleur ? '' : ' dark') + '"' + st + ' title="' + esc(ev.categorie || '') + '">' + esc(ev.quand) + '</span><div class="main"><div class="t">' + esc(ev.titre) + '</div>' + (ev.lieu || ev.categorie ? '<div class="s">' + esc([ev.lieu, ev.categorie].filter(Boolean).join(' · ')) + '</div>' : '') + '</div></div>';
+      }).join('') + '</div>' : '<div class="muted">Agenda vide.</div>') + '</div></div>';
+
+      h += '<div class="section"><h2>Dernières inscriptions</h2><div class="card"><div class="list">' + d.nouveaux.map(function (e) {
+        return '<div class="li click" data-act="eleve" data-src="' + esc(e.source) + '" data-id="' + esc(e.id) + '"><span class="avatar">' + esc(initials(e)) + '</span><div class="main"><div class="t">' + esc(e.prenom + ' ' + e.nom) + '</div><div class="s">' + esc(e.ts) + '</div></div><span class="b">' + (e.source === 'cours' ? 'Cours' : 'Stage') + '</span></div>';
+      }).join('') + '</div></div></div>';
+
+      if (d.prochainsStages.length) h += '<div class="section"><h2>Prochains stages</h2><div class="grid">' + d.prochainsStages.map(function (st) {
+        return '<div class="card click" data-go="stages"><div class="row" style="justify-content:space-between"><b>' + esc(st.nom) + ' · ' + esc(grp(st.groupe)) + '</b>' + statutBadge(st.statut) + '</div><div class="muted small">' + esc(st.dates) + '</div>' + barHtml(st.inscrits, st.max) + '<div class="small">' + st.inscrits + ' / ' + st.max + '</div></div>';
+      }).join('') + '</div></div>';
+      h += '</div></div>';
+      el.innerHTML = h;
+    });
+  };
+  function kpi(v, l, cls, goTo, param) {
+    return '<div class="card kpi click ' + (cls || '') + '" data-go="' + goTo + '"' + (param ? ' data-param="' + P(param) + '"' : '') + '><div class="v">' + esc(v) + '</div><div class="l">' + esc(l) + '</div></div>';
+  }
+  // bulle d'heure aux couleurs de l'agenda Google (vert admin, bleu cours, jaune stage, magenta extérieur)
+  function heureBulle(ev) {
+    var txt = ev.allDay ? 'journée' : (String(ev.quand).split(' ')[2] || '') + (ev.fin ? '-' + ev.fin : '');
+    var st = ev.couleur ? ' style="background:' + esc(ev.couleur) + ';color:#fff;border-color:' + esc(ev.couleur) + '"' : '';
+    return '<span class="b heure' + (ev.couleur ? '' : ' dark') + '"' + st + ' title="' + esc(ev.categorie || '') + '">' + esc(txt) + '</span>';
+  }
+  function rappelItem(r) {
+    var cls = r.enRetard ? 'red' : (r.aujourdhui ? 'yellow' : '');
+    return '<div class="li"><span class="b ' + cls + '">' + esc(r.Date || 'sans date') + (r.Heure ? ' ' + esc(r.Heure) : '') + '</span><div class="main"><div class="t">' + esc(r.Titre) + '</div><div class="s">' + esc(r.Type) + (r.Detail ? ' · ' + esc(r.Detail) : '') + '</div></div>' +
+      '<button class="btn sm" data-act="rappelFait" data-id="' + esc(r.ID) + '">Fait</button></div>';
+  }
+
+  // ---------- Cours ----------
+  VIEWS.cours = function (el, param) {
+    return swr('cours', function (d) {
+      S.data.cours = d;
+      if (param && param.cle) return renderGroupe(el, 'cours', param.cle);
+      var jours = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche'];
+      var h = '<div class="page-head"><div><h1>Cours annuels</h1><p>' + d.total + ' inscriptions actives · ' + d.payes + ' payées (case verte) · 2026-2027</p></div><div class="actions">' +
+        '<a class="btn" href="' + esc(safeUrl(d.fiches)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Fiches présence</a>' +
+        '<a class="btn" href="' + esc(safeUrl(d.sheet)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Sheet réponses</a>' +
+        '<button class="btn primary" data-act="ajout" data-src="cours">' + ICON.plus + 'Inscription</button></div></div>';
+      jours.forEach(function (j) {
+        var ks = d.cours.filter(function (k) { return k.jour === j; });
+        if (!ks.length) return;
+        h += '<div class="day">' + esc(j) + '</div><div class="grid gauto">' + ks.map(function (k) {
+          return '<div class="card click" data-go="cours" data-param="' + P({ cle: k.cle }) + '">' +
+            '<div class="row" style="justify-content:space-between;align-items:flex-start"><div><b style="font-family:var(--head);font-size:18px">' + esc(k.horaire) + '</b><div class="muted small">' + esc(k.libelle) + ' · ' + eur(k.tarif) + '/an</div></div>' + statutBadge(k.statut) + '</div>' +
+            barHtml(k.inscrits, k.max) + '<div class="row small" style="justify-content:space-between"><span><b>' + k.inscrits + '</b> / ' + k.max + ' · ' + k.libres + ' place' + (k.libres > 1 ? 's' : '') + '</span><span>' +
+            (k.alertes ? '<span class="b red">' + k.alertes + ' santé</span> ' : '') + (k.impayes ? '<span class="b">' + k.impayes + ' paiement ?</span>' : '') + '</span></div></div>';
+        }).join('') + '</div>';
+      });
+      if (d.nonClasses.length) {
+        S.data.ratCours = d.cours;
+        h += '<div class="section"><h2>Non classés <span class="b yellow">' + d.nonClasses.length + '</span></h2>' +
+          '<div class="box alert"><h4>Ces inscriptions n\'apparaissent dans aucune liste d\'appel</h4>' +
+          '<p class="small" style="margin:0">Le créneau coché dans le formulaire ne correspond à aucun cours. Choisis le bon créneau ici, l\'inscription est corrigée dans le Sheet réponses.</p></div>' +
+          '<div class="card"><div class="list">' + d.nonClasses.map(function (e, i) {
+            return '<div class="li notes"><span class="avatar">' + esc(initials(e)) + '</span>' +
+              '<div class="main"><div class="t">' + esc(e.prenom + ' ' + e.nom) + '</div><div class="s">Créneau coché : ' + esc(e.creneaux || '(vide)') + '</div></div>' +
+              '<div class="nact"><select class="ratSel" data-id="' + esc(e.id) + '"><option value="">Rattacher à...</option>' +
+              d.cours.map(function (k) { return '<option value="' + esc(k.cle) + '">' + esc(k.jour + ' ' + k.horaire + ' · ' + k.libelle) + '</option>'; }).join('') +
+              '</select><button class="btn sm primary" data-act="rattacher" data-id="' + esc(e.id) + '">Valider</button></div></div>';
+          }).join('') + '</div></div></div>';
+      }
+      h += '<div class="section"><details class="card"><summary><b>Libellés à coller dans le formulaire</b><span class="resume muted small">le code entre crochets fiabilise le rattachement</span></summary>' +
+        '<p class="muted small" style="margin:10px 0">Tu peux écrire ce que tu veux autour du code, « 2 places restantes » compris : tant que le code entre crochets est là, l\'ERP retrouve le cours.</p>' +
+        '<div class="tscroll"><table class="t resp"><thead><tr><th>Cours</th><th>Libellé conseillé</th></tr></thead><tbody>' +
+        d.cours.map(function (k) {
+          return '<tr><td data-l="Cours">' + esc(k.jour + ' ' + k.horaire) + '</td><td data-l="Libellé"><code>' + esc(k.libelleForm || (k.libelle + ' - ' + k.jour + ' ' + k.horaire + ' [' + k.code + ']')) + '</code></td></tr>';
+        }).join('') + '</tbody></table></div></details></div>';
+      if (d.desinscrits.length) h += '<div class="section"><h2>Désinscrits</h2><div class="card"><div class="list">' + d.desinscrits.map(function (e) { return eleveItem(e); }).join('') + '</div></div></div>';
+      if (d.desistements && d.desistements.length) h += '<div class="section"><h2>Désistements <span class="b">' + d.desistements.length + '</span></h2><p class="muted small">Onglet « ' + esc(d.desistements[0].onglet) + ' » du Sheet réponses</p><div class="card"><div class="list">' + d.desistements.map(function (x) { return '<div class="li"><span class="avatar">' + esc(initials(x)) + '</span><div class="main"><div class="t">' + esc(x.prenom + ' ' + x.nom) + '</div><div class="s">' + esc(x.creneaux) + '</div></div></div>'; }).join('') + '</div></div></div>';
+      el.innerHTML = h;
+    });
+  };
+
+  // ---------- Stages ----------
+  VIEWS.stages = function (el, param) {
+    return swr('stages', function (d) {
+      S.data.stages = d;
+      if (param && param.cle) return renderGroupe(el, 'stages', param.cle);
+      var h = '<div class="page-head"><div><h1>Stages vacances</h1><p>' + d.total + ' inscriptions actives · ' + d.payes + ' payées (case verte)</p></div><div class="actions">' +
+        '<a class="btn" href="' + esc(safeUrl(d.fiches)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Fiches présence</a>' +
+        '<a class="btn" href="' + esc(safeUrl(d.sheet)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Sheet réponses</a>' +
+        '<button class="btn primary" data-act="ajout" data-src="stages">' + ICON.plus + 'Inscription</button></div></div>';
+      var noms = [];
+      d.stages.forEach(function (s) { if (noms.indexOf(s.nom) < 0) noms.push(s.nom); });
+      noms.forEach(function (nom) {
+        var ss = d.stages.filter(function (s) { return s.nom === nom; });
+        h += '<div class="day">' + esc(nom) + ' · ' + esc(ss[0].dates) + '</div><div class="grid g2">' + ss.map(function (s) {
+          return '<div class="card click" data-go="stages" data-param="' + P({ cle: s.id }) + '">' +
+            '<div class="row" style="justify-content:space-between;align-items:flex-start"><div><b style="font-family:var(--head);font-size:18px">' + esc(grp(s.groupe)) + '</b><div class="muted small">' + esc(s.public) + ' · ' + eur(s.tarif) + '</div></div>' + statutBadge(s.statut) + '</div>' +
+            barHtml(s.inscrits, s.max) + '<div class="row small" style="justify-content:space-between"><span><b>' + s.inscrits + '</b> / ' + s.max + '</span><span>' +
+            (s.alertes ? '<span class="b red">' + s.alertes + ' santé</span> ' : '') + (s.impayes ? '<span class="b">' + s.impayes + ' paiement ?</span> ' : '') + (s.attente ? '<span class="b yellow">' + s.attente + ' en attente</span>' : '') + '</span></div></div>';
+        }).join('') + '</div>';
+      });
+      if (d.nonClasses.length) h += '<div class="section"><h2>Non classés <span class="b yellow">' + d.nonClasses.length + '</span></h2><div class="card"><div class="list">' + d.nonClasses.map(function (e) { return eleveItem(e); }).join('') + '</div></div></div>';
+      if (d.desinscrits.length) h += '<div class="section"><h2>Désinscrits</h2><div class="card"><div class="list">' + d.desinscrits.map(function (e) { return eleveItem(e); }).join('') + '</div></div></div>';
+      if (d.desistements && d.desistements.length) h += '<div class="section"><h2>Désistements <span class="b">' + d.desistements.length + '</span></h2><p class="muted small">Onglet « ' + esc(d.desistements[0].onglet) + ' » du Sheet réponses</p><div class="card"><div class="list">' + d.desistements.map(function (x) { return '<div class="li"><span class="avatar">' + esc(initials(x)) + '</span><div class="main"><div class="t">' + esc(x.prenom + ' ' + x.nom) + '</div><div class="s">' + esc(x.creneaux) + '</div></div></div>'; }).join('') + '</div></div></div>';
+      el.innerHTML = h;
+    });
+  };
+
+  function renderGroupe(el, src, cle) {
+    var d = S.data[src];
+    var g = src === 'cours' ? d.cours.filter(function (k) { return k.cle === cle; })[0] : d.stages.filter(function (s) { return s.id === cle; })[0];
+    if (!g) { el.innerHTML = '<div class="empty">Groupe introuvable.</div>'; return; }
+    var titre = src === 'cours' ? g.jour + ' ' + g.horaire : g.nom + ' · ' + grp(g.groupe);
+    var sous = src === 'cours' ? g.libelle + ' · ' + eur(g.tarif) + '/an' : g.dates + ' · ' + g.public;
+    var prefill = src === 'cours' ? g.cle : g.id;
+    var h = '<button class="btn ghost sm" data-go="' + src + '">' + ICON.back + 'Retour</button>' +
+      '<div class="page-head" style="margin-top:8px"><div><h1>' + esc(titre) + '</h1><p>' + esc(sous) + '</p></div><div class="actions">' +
+      '<button class="btn primary" data-act="appel" data-src="' + src + '" data-cle="' + esc(cle) + '">' + ICON.check + 'Faire l\'appel</button>' +
+      '<button class="btn dark" data-act="urgGroupe" data-src="' + src + '" data-cle="' + esc(cle) + '">' + ICON.urg + 'Mode piste</button>' +
+      '<button class="btn' + (g.attente ? ' dark' : ' ghost') + '" data-act="attente" data-src="' + src + '" data-cle="' + esc(cle) + '">Liste d\'attente' + (g.attente ? ' (' + g.attente + ')' : '') + '</button>' +
+      '<button class="btn ghost" data-act="reglagesGroupe" data-src="' + src + '" data-cle="' + esc(cle) + '" title="Places max, tarif">Réglages</button>' +
+      '<button class="btn" data-act="ajout" data-src="' + src + '" data-prefill="' + esc(prefill) + '">' + ICON.plus + 'Ajouter</button></div></div>' +
+      '<div class="grid g4">' + kpiStatic(g.inscrits + ' / ' + g.max, 'inscrits') + kpiStatic(g.libres, 'places libres') + kpiStatic(g.alertes, 'alertes santé', g.alertes ? 'red' : '') + kpiStatic(g.impayes, 'paiements non notés') + '</div>' +
+      '<div class="section card">' + (g.eleves.length ? '<div class="list">' + g.eleves.map(function (e) { return eleveItem(e); }).join('') + '</div>' : '<div class="empty">Personne pour l\'instant.</div>') + '</div>';
+    el.innerHTML = h;
+    prechargerAppel(src, cle);   // sans attendre : le clic sur « Faire l'appel » arrive vite
+  }
+  function kpiStatic(v, l, cls) { return '<div class="card kpi ' + (cls || '') + '"><div class="v">' + esc(v) + '</div><div class="l">' + esc(l) + '</div></div>'; }
+
+  // ---------- liste d'attente : les gens en attente ne sont PAS des inscrits ----------
+  ACT.attente = function (t) {
+    var src = t.dataset.src, cle = t.dataset.cle;
+    ouvrirAttente(src, cle);
+  };
+  // libellé lisible d'un créneau, depuis le cache
+  function groupesPourAttente(src) {
+    var d = (PAGES[src] && PAGES[src].data) || {};
+    return ((src === 'cours' ? d.cours : d.stages) || []).map(function (g) {
+      return src === 'cours' ? { cle: g.cle, label: g.jour + ' ' + g.horaire + ' · ' + g.libelle } : { cle: g.id, label: g.nom + ' · ' + grp(g.groupe) };
+    });
+  }
+  function labelGroupe(src, cle) {
+    var g = groupesPourAttente(src).filter(function (x) { return String(x.cle) === String(cle); })[0];
+    return g ? g.label : String(cle || '');
+  }
+  function ouvrirAttente(src, cle) {
+    var groupes = groupesPourAttente(src);
+    openDrawer(cle ? 'Liste d\'attente' : 'Liste d\'attente · ' + (src === 'cours' ? 'tous les cours' : 'tous les stages'), '<div class="loader"><span></span></div>');
+    call('attente', { source: src, cle: cle }).then(function (l) {
+      S.attente = { src: src, cle: cle, liste: l };
+      var actifs = l.filter(function (r) { return r.actif; });
+      drawerBody('<p class="muted small" style="margin-top:0">Ces personnes ne comptent pas dans les effectifs. Elles sont notées dans l\'onglet <b>Attente</b> du classeur ERP, pas dans les Sheets d\'inscription.</p>' +
+        '<div class="card"><div class="list">' + (l.length ? l.map(function (r, i) {
+          var st = r.Statut || 'En attente';
+          var cls = /inscrit/i.test(st) ? 'green' : (/contact/i.test(st) ? 'blue' : (/abandon/i.test(st) ? 'dark' : 'yellow'));
+          return '<div class="li"><span class="b ' + cls + '">' + esc(st) + '</span><div class="main"><div class="t">' + esc((r.Prenom || '') + ' ' + (r.Nom || '')) + '</div>' +
+            '<div class="s">' + esc([(cle ? '' : labelGroupe(src, r.CleGroupe)), r.Date, r.Responsable, r.Tel, r.Email, r.Notes].filter(Boolean).join(' · ')) + '</div></div>' +
+            (r.actif ? '<button class="btn sm" data-act="attenteStatut" data-id="' + esc(r.ID) + '" data-s="Contacté">Contacté</button>' +
+              '<button class="btn sm primary" data-act="attenteInscrire" data-i="' + i + '">Inscrire</button>' : '') +
+            '<button class="btn sm ghost danger" data-act="attenteSuppr" data-id="' + esc(r.ID) + '" title="Retirer">✕</button></div>';
+        }).join('') : '<div class="muted">Personne en attente.</div>') + '</div></div>' +
+        '<div class="hr"></div><h3>Ajouter quelqu\'un</h3>' +
+        '<form id="fAtt">' +
+        (cle ? '' : '<div class="field"><label>Pour quel ' + (src === 'cours' ? 'cours' : 'stage') + ' ?</label><select name="CleGroupe" required>' +
+          groupes.map(function (g) { return '<option value="' + esc(g.cle) + '">' + esc(g.label) + '</option>'; }).join('') + '</select></div>') +
+        '<div class="row"><div class="field"><label>Nom</label><input name="Nom"></div><div class="field"><label>Prénom</label><input name="Prenom" required></div></div>' +
+        '<div class="row"><div class="field"><label>Parent / responsable</label><input name="Responsable"></div><div class="field"><label>Date de naissance</label><input type="date" name="Naissance"></div></div>' +
+        '<div class="row"><div class="field"><label>Téléphone</label><input name="Tel" inputmode="tel"></div><div class="field"><label>Email</label><input name="Email" type="email"></div></div>' +
+        '<div class="field"><label>Notes</label><input name="Notes" placeholder="Ex : prendrait aussi le mercredi"></div>' +
+        '<button class="btn primary big" type="submit" style="width:100%">Ajouter à la liste d\'attente</button></form>' +
+        '<p class="muted small">' + actifs.length + ' personne(s) en attente' + (cle ? ' sur ce créneau' : ' au total') + '.</p>');
+      var f = $('#fAtt');
+      f.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var b = f.querySelector('button[type=submit]'); busy(b, true);
+        var o = { Source: src };
+        if (cle) o.CleGroupe = cle;
+        $all('[name]', f).forEach(function (i) { o[i.name] = i.value; });
+        call('saveAttente', o).then(function () { toast('Ajouté à la liste d\'attente'); ouvrirAttente(src, cle); if (S.view === 'cours' || S.view === 'stages') go(S.view, S.param); })
+          .catch(function (e) { busy(b, false); fail(e); });
+      });
+    }).catch(fail);
+  }
+  ACT.attenteStatut = function (t) {
+    busy(t, true);
+    var A = S.attente;
+    call('statutAttente', { id: t.dataset.id, statut: t.dataset.s }).then(function () { ouvrirAttente(A.src, A.cle); }).catch(function (e) { busy(t, false); fail(e); });
+  };
+  ACT.attenteSuppr = function (t) {
+    if (!confirm('Retirer cette personne de la liste d\'attente ?')) return;
+    busy(t, true);
+    var A = S.attente;
+    call('supprimerAttente', { id: t.dataset.id }).then(function () { toast('Retiré'); ouvrirAttente(A.src, A.cle); if (S.view === 'cours' || S.view === 'stages') go(S.view, S.param); }).catch(function (e) { busy(t, false); fail(e); });
+  };
+  // une place se libère : on bascule la personne en vraie inscription (formulaire pré-rempli)
+  ACT.attenteInscrire = function (t) {
+    var A = S.attente, r = A.liste[+t.dataset.i];
+    S.attentePrefill = { id: r.ID, valeurs: { nom: r.Nom, prenom: r.Prenom, naissance: frToIso(r.Naissance || ''), responsable: r.Responsable, tel: r.Tel, email: r.Email, emailContact: r.Email, commentaire: r.Notes } };
+    ACT.ajout({ dataset: { src: A.src, prefill: A.cle || r.CleGroupe } });
+  };
+  ACT.reglagesGroupe = function (t) {
+    var src = t.dataset.src, cle = t.dataset.cle;
+    openDrawer('Réglages du créneau', '<div class="loader"><span></span></div>');
+    call('reglagesGroupe', { source: src, cle: cle, lire: true }).then(function (r) {
+      drawerBody('<form id="fReg"><p class="muted small" style="margin-top:0">' + esc(r.Libelle || '') + ' · ' + esc(r.Horaire || '') + '</p>' +
+        '<div class="row"><div class="field"><label>Places max</label><input name="Max" inputmode="numeric" required value="' + esc(String(r.Max || '')) + '"></div>' +
+        '<div class="field"><label>Tarif (€)</label><input name="Tarif" inputmode="decimal" value="' + esc(String(r.Tarif || '')) + '"></div></div>' +
+        '<div class="field"><label>Public</label><input name="Public" value="' + esc(r.Public || '') + '"></div>' +
+        '<button class="btn primary big" type="submit" style="width:100%">Enregistrer</button>' +
+        '<p class="muted small">Écrit dans l\'onglet ' + (src === 'cours' ? 'Cours' : 'Stages') + ' du classeur ERP.</p></form>');
+      var f = $('#fReg');
+      f.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        var b = f.querySelector('button[type=submit]'); busy(b, true);
+        call('reglagesGroupe', { source: src, cle: cle, Max: f.Max.value, Tarif: String(f.Tarif.value).replace(',', '.'), Public: f.Public.value })
+          .then(function () { closeDrawer(); toast('Réglages enregistrés'); go(S.view, S.param); })
+          .catch(function (e) { busy(b, false); fail(e); });
+      });
+    }).catch(fail);
+  };
+  ACT.urgGroupe = function (t) {
+    var src = t.dataset.src, cle = t.dataset.cle;
+    openDrawer('Mode piste', '<div class="loader"><span></span></div>');
+    call('urgencesGroupe', { source: t.dataset.src, cle: t.dataset.cle }).then(function (d) {
+      $('#drawerTitle').textContent = d.titre;
+      drawerBody('<div class="row" style="justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><p class="muted small" style="margin:0">' + d.eleves.length + ' ' + V('membres') + ' · alertes santé en premier</p><button class="btn sm primary" data-act="appel" data-src="' + esc(src) + '" data-cle="' + esc(cle) + '">' + ICON.check + 'Faire l\'appel</button></div><div style="height:10px"></div><div class="grid">' + (d.eleves.map(urgCard).join('') || '<div class="empty">Personne.</div>') + '</div>');
+    }).catch(fail);
+  };
+
+  // ---------- Appel (fiches de présence) ----------
+  // l'appel est déjà en cache depuis la connexion : il s'affiche tout de suite
+  ACT.appel = function (t) {
+    var src = t.dataset.src, cle = t.dataset.cle, k = 'appel|' + src + '|' + cle;
+    function montrer(d) {
+      S.appel = { src: src, cle: cle, d: JSON.parse(JSON.stringify(d)), seance: d.defaut, dirty: false };
+      $('#drawerTitle').textContent = 'Appel · ' + d.onglet;
+      renderAppel();
+    }
+    var had = PAGES[k];
+    if (had) {
+      openDrawer('Appel', ''); montrer(had.data);
+      if (Date.now() - had.t > FRAIS) charger(k).then(function (d) { if ($('#drawer').classList.contains('open') && S.appel && S.appel.cle === cle && !S.appel.dirty && JSON.stringify(d) !== had.js) montrer(d); }).catch(function () { });
+      return;
+    }
+    openDrawer('Appel', '<div class="loader"><span></span></div><p class="muted small" style="text-align:center">Ouverture de la fiche de présence…</p>');
+    charger(k).then(function (d) { if ($('#drawer').classList.contains('open')) montrer(d); }).catch(fail);
+  };
+  // Appel : une seule case « Présent » par enfant (non cochée = absent à l'enregistrement).
+  // Un E (excusé), Es (essai) ou autre texte déjà noté dans la fiche est gardé tant que la case reste vide.
+  function renderAppel() {
+    var A = S.appel, d = A.d;
+    if (!d.eleves.length) { drawerBody('<div class="empty">Aucun nom sur la fiche « ' + esc(d.onglet) + ' ». Si la personne vient d\'être ajoutée, la fiche se met à jour en 1 à 2 min.</div><a class="btn" href="' + esc(safeUrl(d.lien)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Ouvrir la fiche</a>'); return; }
+    var nP = d.eleves.filter(function (e) { return e.marks[A.seance] === 'P'; }).length;
+    var nE = d.eleves.filter(function (e) { return e.marks[A.seance] === 'E'; }).length;
+    var h = '<div class="field"><label for="appelSeance">Séance</label><select id="appelSeance">' + d.seances.map(function (x) {
+      var nb = d.eleves.filter(function (e) { return e.marks[x.label]; }).length;
+      return '<option value="' + esc(x.label) + '"' + (x.label === A.seance ? ' selected' : '') + '>' + esc(x.label + (x.date ? ' · ' + x.date : '') + (nb ? ' (déjà faite)' : '')) + '</option>';
+    }).join('') + '</select></div>' +
+      '<div class="row" style="justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 8px"><b id="appelCompte">' + nP + ' présent' + (nP > 1 ? 's' : '') + ' sur ' + d.eleves.length + '</b>' +
+      '<button class="btn sm" data-act="appelTous">Tout cocher</button></div>' +
+      '<div class="appel-list">' + d.eleves.map(function (e, i) {
+        var m = e.marks[A.seance] || '';
+        var tag = m === 'S' ? 'cours d\'essai' : (m.indexOf('T:') === 0 ? m.slice(2) : '');
+        return '<div class="appel-row' + (m === 'P' ? ' on' : (m === 'E' ? ' exc' : '')) + '">' +
+          '<label class="cocher"><input type="checkbox" data-i="' + i + '"' + (m === 'P' ? ' checked' : '') + '>' +
+          '<span class="nm">' + esc(e.prenom + ' ' + e.nom) + '</span></label>' +
+          (tag ? '<span class="b yellow">' + esc(tag) + '</span>' : '') +
+          '<button type="button" class="exc' + (m === 'E' ? ' on' : '') + '" data-act="appelExc" data-i="' + i + '" aria-pressed="' + (m === 'E') + '">Exc.</button></div>';
+      }).join('') + '</div>' +
+      '<div class="actions appel-bar"><button class="btn primary big" data-act="appelSave">Enregistrer l\'appel</button>' +
+      '<a class="btn" href="' + esc(safeUrl(d.lien)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Fiche</a></div>' +
+      '<p class="muted small">Coche les enfants présents, bouton <b>Exc.</b> pour un absent excusé. Les autres seront notés absents dans la fiche.' +
+      ((d.masques && d.masques.length) ? '<br>Pas affiché' + (d.masques.length > 1 ? 's' : '') + ' (désistement / désinscription) : ' + esc(d.masques.join(', ')) + '.' : '') + '</p>';
+    drawerBody(h);
+    $('#appelSeance').addEventListener('change', function (ev) {
+      if (A.dirty && !confirm('Appel pas enregistré pour « ' + A.seance + ' ». Changer quand même ?')) { ev.target.value = A.seance; return; }
+      if (A.dirty) A.d = JSON.parse(A.orig);
+      A.seance = ev.target.value; A.dirty = false; renderAppel();
+    });
+    $('#drawerBody .appel-list').addEventListener('change', function (ev) {
+      var c = ev.target; if (!c.dataset || c.dataset.i === undefined) return;
+      var e = A.d.eleves[+c.dataset.i];
+      appelTouch();
+      if (c.checked) e.marks[A.seance] = 'P'; else if (e.marks[A.seance] === 'P') delete e.marks[A.seance];
+      var row = c.closest('.appel-row');
+      row.classList.toggle('on', c.checked); if (c.checked) row.classList.remove('exc');
+      majCompteAppel();
+    });
+  }
+  function majCompteAppel() {
+    var A = S.appel, sea = A.seance;
+    var n = A.d.eleves.filter(function (x) { return x.marks[sea] === 'P'; }).length;
+    var e = A.d.eleves.filter(function (x) { return x.marks[sea] === 'E'; }).length;
+    var el = $('#appelCompte');
+    if (el) el.textContent = n + ' présent' + (n > 1 ? 's' : '') + ' sur ' + A.d.eleves.length + (e ? ' · ' + e + ' excusé' + (e > 1 ? 's' : '') : '');
+  }
+  ACT.appelExc = function (t) {
+    var A = S.appel, e = A.d.eleves[+t.dataset.i];
+    appelTouch();
+    var etait = e.marks[A.seance] === 'E';
+    if (etait) delete e.marks[A.seance]; else e.marks[A.seance] = 'E';
+    var row = t.closest('.appel-row');
+    row.classList.toggle('exc', !etait); row.classList.remove('on');
+    var c = row.querySelector('input[type=checkbox]'); if (c) c.checked = false;
+    t.classList.toggle('on', !etait); t.setAttribute('aria-pressed', String(!etait));
+    majCompteAppel();
+  };
+  function appelTouch() { var A = S.appel; if (!A.dirty) { A.orig = JSON.stringify(A.d); A.dirty = true; } }
+  ACT.appelTous = function () {
+    var A = S.appel; appelTouch();
+    A.d.eleves.forEach(function (e) { if (e.marks[A.seance] !== 'E') e.marks[A.seance] = 'P'; });
+    renderAppel();
+  };
+  ACT.appelSave = function (t) {
+    var A = S.appel; t.disabled = true; t.textContent = 'Enregistrement...';
+    call('saveAppel', { source: A.src, cle: A.cle, seance: A.seance, marks: A.d.eleves.map(function (e) { return { nom: e.nom, prenom: e.prenom, statut: e.marks[A.seance] || 'A' }; }) }).then(function () {
+      A.dirty = false; toast('Appel enregistré dans la fiche'); renderAppel();
+      PAGES['appel|' + A.src + '|' + A.cle] = { data: JSON.parse(JSON.stringify(A.d)), js: JSON.stringify(A.d), t: Date.now() };
+    }).catch(function (e) { t.disabled = false; t.textContent = 'Enregistrer l\'appel'; fail(e); });
+  };
+
+  // ---------- Urgences / recherche ----------
+  // ---------- Liste complète des inscrits (vignettes de l'accueil) ----------
+  VIEWS.eleves = function (el, param) {
+    var src = (param && param.src) === 'stages' ? 'stages' : 'cours';
+    return swrN([src, 'attente'], function (rr) {
+      var d = rr[0], att = (rr[1] || []).filter(function (r) { return String(r.Source) === src && r.actif; });
+      S.data[src] = d;
+      var groupes = src === 'cours' ? d.cours : d.stages;
+      var parId = {}, ordre = [];
+      groupes.forEach(function (g) {
+        var lab = src === 'cours' ? g.jour + ' ' + g.horaire : g.nom + ' ' + grp(g.groupe);
+        g.eleves.forEach(function (e) {
+          if (!parId[e.id]) { parId[e.id] = { e: e, g: [] }; ordre.push(e.id); }
+          parId[e.id].g.push(lab);
+        });
+      });
+      (d.nonClasses || []).forEach(function (e) { if (!parId[e.id]) { parId[e.id] = { e: e, g: ['non classé'] }; ordre.push(e.id); } });
+      var tous = ordre.map(function (id) { return parId[id]; }).sort(function (a, b) {
+        return (a.e.nom + ' ' + a.e.prenom).localeCompare(b.e.nom + ' ' + b.e.prenom, 'fr', { sensitivity: 'base' });
+      });
+      var filtre = S.data.elevesFiltre || 'tous';
+      var nAtt = groupes.reduce(function (a, g) { return a + (g.attente || 0); }, 0);
+      el.innerHTML = '<div class="page-head"><div><h1>' + (src === 'cours' ? Vmaj('membres') + ' ' + V('coursPl') + ' annuels' : 'Inscrits en ' + V('stage')) + '</h1><p>' + tous.length + ' ' + V('membres') + ' · clique sur un nom pour sa fiche</p></div>' +
+        '<div class="actions"><button class="btn' + (nAtt ? ' dark' : ' ghost') + '" data-act="attente" data-src="' + src + '" data-cle="">Liste d\'attente' + (nAtt ? ' (' + nAtt + ')' : '') + '</button>' +
+        '<button class="btn primary" data-act="ajout" data-src="' + src + '">' + ICON.plus + 'Inscription</button></div></div>' +
+        '<div class="search">' + ICON.search + '<input id="eq" type="search" placeholder="Nom, prénom, parent..." autocomplete="off"></div>' +
+        '<div class="chips">' + [['tous', 'Tous'], ['impayes', 'Paiement ?'], ['sante', 'Alerte santé'], ['infos', 'Infos manquantes']].map(function (c) {
+          return '<button class="chip' + (filtre === c[0] ? ' on' : '') + '" data-act="elevesFiltre" data-f="' + c[0] + '">' + c[1] + '</button>';
+        }).join('') + '</div><div class="card"><div class="list" id="elist"></div></div>' +
+        (att.length ? '<div class="section"><h2>En liste d\'attente <span class="b yellow">' + att.length + '</span></h2><div class="card"><p class="muted small" style="margin-top:0">Pas encore inscrits : ces personnes ne sont comptées nulle part. Bouton <b>Liste d\'attente</b> en haut pour les gérer.</p><div class="list">' +
+          att.map(function (r) {
+            return '<div class="li"><span class="b yellow">' + esc(r.Statut || 'En attente') + '</span><div class="main"><div class="t">' + esc((r.Prenom || '') + ' ' + (r.Nom || '')) + '</div>' +
+              '<div class="s">' + esc([labelGroupe(src, r.CleGroupe), r.Responsable, r.Tel, r.Email].filter(Boolean).join(' · ')) + '</div></div></div>';
+          }).join('') + '</div></div></div>' : '');
+      function show() {
+        var words = normTxt($('#eq').value).split(/\s+/).filter(String);
+        var res = tous.filter(function (x) {
+          var e = x.e;
+          if (filtre === 'impayes' && e.paye === 'Oui') return false;
+          if (filtre === 'sante' && !e.alerteSante) return false;
+          if (filtre === 'infos' && !(e.manquants && e.manquants.length)) return false;
+          var hay = normTxt([e.nom, e.prenom, e.responsable, e.tel].join(' '));
+          return words.every(function (w) { return hay.indexOf(w) >= 0; });
+        });
+        $('#elist').innerHTML = res.length ? res.map(function (x) { return eleveItem(x.e, x.g.join(' + ')).replace('<div class="s">', '<div class="s">' + esc(x.g.join(' + ')) + ' · '); }).join('') : '<div class="empty">Aucun résultat.</div>';
+      }
+      $('#eq').addEventListener('input', show);
+      show();
+    });
+  };
+  ACT.elevesFiltre = function (t) { S.data.elevesFiltre = t.dataset.f; go('eleves', S.param); };
+
+  // Infos urgentes : toute la liste est préchargée, la recherche se fait dans le téléphone (instantané)
+  function normTxt(v) { return String(v || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase(); }
+  VIEWS.urgences = function (el) {
+    el.innerHTML = '<div class="page-head"><div><h1>Infos urgentes</h1><p>Cherche un enfant (nom, prénom, parent, téléphone). Sans recherche : tous les enfants avec une alerte santé.</p></div></div>' +
+      '<div class="search">' + ICON.search + '<input id="q" type="search" placeholder="Ex : Loup, Wyss, 06 72..." autocomplete="off"></div><div id="res"><div class="loader"><span></span></div></div>';
+    var q = $('#q'), list = null;
+    function show() {
+      if (!list || !$('#res')) return;
+      var words = normTxt(q.value).split(/\s+/).filter(String);
+      var res = !words.length ? list.filter(function (e) { return e.alerteSante; }) : list.filter(function (e) {
+        var hay = normTxt([e.nom, e.prenom, e.responsable, e.tel, e.emailBest, e.creneaux, e.stage].join(' '));
+        return words.every(function (w) { return hay.indexOf(w) >= 0; });
+      });
+      $('#res').innerHTML = res.length ? '<div class="grid gauto">' + res.slice(0, 80).map(urgCard).join('') + '</div>' : '<div class="empty">Aucun résultat.</div>';
+    }
+    q.addEventListener('input', show);
+    setTimeout(function () { q.focus(); }, 50);
+    return swr('urgencesTous', function (d) { list = d; show(); });
+  };
+
+  // ---------- Fiche d'un inscrit ----------
+  ACT.eleve = function (t) { ficheEleve(t.dataset.src, t.dataset.id); };
+
+  // fiche individuelle : affichée tout de suite depuis le cache, puis vérifiée auprès du serveur
+  function eleveEnCache(src, id) {
+    var d = PAGES[src] && PAGES[src].data;
+    if (!d) return null;
+    var groupes = src === 'cours' ? d.cours : d.stages, trouve = null, mes = [];
+    groupes.forEach(function (g) {
+      g.eleves.forEach(function (e) {
+        if (e.id !== id) return;
+        trouve = e;
+        mes.push(src === 'cours' ? { cle: g.cle, label: g.jour + ' ' + g.horaire + ' · ' + g.libelle } : { cle: g.id, label: g.nom + ' · ' + grp(g.groupe) });
+      });
+    });
+    if (!trouve) (d.nonClasses || []).concat(d.desinscrits || []).forEach(function (e) { if (e.id === id) trouve = e; });
+    if (!trouve) return null;
+    var c = JSON.parse(JSON.stringify(trouve)); c.groupes = mes;
+    return c;
+  }
+  function ficheEleve(src, id) {
+    var c = eleveEnCache(src, id);
+    if (c) { openDrawer(c.prenom + ' ' + c.nom, ''); dessinerFiche(c); }
+    else openDrawer('Fiche', '<div class="loader"><span></span></div>');
+    call('eleve', { source: src, id: id }).then(function (e) {
+      if (!$('#drawer').classList.contains('open')) return;
+      if (c) {
+        if (!S.data.eleve || S.data.eleve.id !== id || !$('#fPaye')) return;       // on a changé d'écran
+        var ae = document.activeElement;
+        if (ae && ae.closest && ae.closest('#drawerBody') && /INPUT|TEXTAREA|SELECT/.test(ae.tagName)) return;
+        if (JSON.stringify(e) === JSON.stringify(c)) return;
+      }
+      dessinerFiche(e);
+    }).catch(function (err) { if (!c) fail(err); });
+  }
+  function dessinerFiche(e) {
+    {
+      var src = e.source, id = e.id;
+      S.data.eleve = e;
+      $('#drawerTitle').textContent = e.prenom + ' ' + e.nom;
+      var kv = function (pairs) {
+        return '<dl class="kv">' + pairs.filter(function (p) { return p[1] !== undefined && p[1] !== ''; }).map(function (p) { return '<dt>' + esc(p[0]) + '</dt><dd' + (p[2] ? ' class="neg"' : '') + '>' + esc(p[1]) + '</dd>'; }).join('') + '</dl>';
+      };
+      var h = '';
+      h += '<div class="box' + (e.alerteSante ? ' alert' : '') + '"><h4>Santé & urgence</h4>' + kv([
+        ['Allergies', e.allergies, !isRas(e.allergies)], ['Santé / PAI', e.sante, !isRas(e.sante)], ['Vaccins à jour', e.vaccins],
+        ['Personne à prévenir', e.urgence || 'NON RENSEIGNÉ', !e.urgence], ['Autorisation soins', e.soins || 'NON RENSEIGNÉ', !e.soins],
+        ['Repart seul', e.repartSeul], ['Personnes autorisées', e.autorises]]) + '<div>' + telLinks([e.urgence, e.tel, e.second].join(' ')) + '</div></div>';
+      h += '<div class="box"><h4>Identité & inscription</h4>' + kv([
+        ['Naissance', e.naissance + (e.age !== '' ? ' (' + e.age + ' ans)' : '')], [src === 'cours' ? 'Créneau(x)' : 'Stage', e.creneaux || e.stage],
+        ['Niveau', e.niveau], ["Cours d'essai", e.essai], ['Inscrit le', e.ts], ['Droit image', e.image], ['Assurance RC', e.assurance], ['Adhésion', e.adhesion], ['Réductions', e.reductions]]) + '</div>';
+      h += '<div class="box"><h4>Famille</h4>' + kv([['Responsable', e.responsable], ['Lien', e.lien], ['Téléphone', e.tel], ['Email', e.emailBest], ['2e contact', e.second], ['Adresse', e.adresse]]) + '</div>';
+      h += '<div class="box"><h4>Suivi admin</h4>' +
+        '<div class="row"><div class="field"><label>Paiement</label><select id="fPaye">' + ['Non', 'Partiel', 'Oui'].map(function (o) { return '<option' + (e.paye === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select></div>' +
+        '<div class="field"><label>Montant reçu (€)</label><input id="fMontant" inputmode="decimal" value="' + esc(e.montantRecu) + '"></div>' +
+        '<div class="field"><label>Mode</label><select id="fMode">' + ['', 'Virement', 'Chèque', 'Cash'].map(function (o) { return '<option' + (e.modeRecu === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select></div></div>' +
+        '<div class="row"><div class="field"><label>Statut</label><select id="fStatut">' + ['Actif', 'Désinscrit'].map(function (o) { return '<option' + (e.statut === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select></div></div>' +
+        '<div class="field"><label>Notes</label><textarea id="fNotes">' + esc(e.notes) + '</textarea></div>' +
+        '<label class="small" style="display:flex;gap:8px;align-items:center;margin-bottom:12px"><input type="checkbox" id="fCaisse"> Ajouter aussi ce montant dans la caisse (Modele_economique)</label>' +
+        '<button class="btn primary" data-act="saveSuivi">Enregistrer le suivi</button>' +
+        '<p class="muted small">Payé = case Nom en vert dans le Sheet réponses. Enregistrer ici met la case en vert (payé), en jaune (partiel) ou enlève la couleur.' + (e.payeSource ? ' Statut actuel lu depuis : ' + esc(e.payeSource) + '.' : '') + '</p>' +
+        (e.modePaiement ? '<p class="muted small">Mode choisi dans le Form : ' + esc(e.modePaiement) + '</p>' : '') +
+        (e.derniereRelance ? '<p class="muted small">Dernière relance : ' + esc(e.derniereRelance) + '</p>' : '') + '</div>';
+      h += '<div class="box' + (e.statut === 'Désinscrit' ? ' alert' : '') + '"><h4>Présence sur les listes</h4>' +
+        (e.statut === 'Désinscrit'
+          ? '<p class="small" style="margin-top:0"><b>' + esc(e.prenom) + '</b> est noté <b>désinscrit</b> : plus compté dans les effectifs, plus proposé dans les fiches d\'appel, plus relancé.</p>' +
+            '<button class="btn" data-act="desister" data-s="Actif">Remettre dans le cours</button>'
+          : '<p class="small" style="margin-top:0">Départ en cours d\'année, désistement, changement d\'avis : le retirer des effectifs et des fiches d\'appel. La ligne reste dans le Sheet réponses, rien n\'est effacé.</p>' +
+            '<button class="btn danger" data-act="desister" data-s="Désinscrit">Noter un désistement / une désinscription</button>') + '</div>';
+      h += '<div class="box"><h4>Actions</h4><div class="actions">' +
+        '<button class="btn" data-act="mailApercu" data-type="confirmation">' + ICON.mail + 'Mail de confirmation</button>' +
+        '<button class="btn" data-act="mailApercu" data-type="relance">' + ICON.mail + 'Mail de relance</button>' +
+        '<button class="btn" data-act="deplacer">' + (src === 'cours' ? 'Changer de cours' : 'Changer de stage') + '</button>' +
+        '<button class="btn" data-act="modifier">Modifier les infos</button>' +
+        '<button class="btn danger" data-act="supprimer">Supprimer</button></div>' +
+        (e.manquants.length ? '<p class="small" style="margin-bottom:0"><span class="b yellow">Manque</span> ' + esc(e.manquants.join(', ')) + '</p>' : '') + '</div>';
+      drawerBody(h);
+    }
+  }
+
+  ACT.desister = function (t) {
+    var e = S.data.eleve, vers = t.dataset.s;
+    if (!e) return;
+    if (vers === 'Désinscrit' && !confirm(e.prenom + ' ' + e.nom + ' ne fait plus partie du cours ?\n\nIl / elle disparaît des effectifs et des fiches d\'appel. La ligne reste dans le Sheet réponses.')) return;
+    busy(t, true);
+    call('suivi', { source: e.source, id: e.id, nom: e.nom, prenom: e.prenom, Statut: vers })
+      .then(function () {
+        toast(vers === 'Désinscrit' ? 'Désistement noté' : 'Remis dans le cours');
+        e.statut = vers; dessinerFiche(e);
+        if (S.view === 'cours' || S.view === 'stages' || S.view === 'eleves') go(S.view, S.param);
+      }).catch(function (err) { busy(t, false); fail(err); });
+  };
+
+  ACT.saveSuivi = function (t) {
+    var e = S.data.eleve;
+    var montant = $('#fMontant').value, mode = $('#fMode').value;
+    var addCaisse = $('#fCaisse').checked;
+    if (addCaisse && (!Number(String(montant).replace(',', '.')) || !mode)) return toast('Pour la caisse : montant et mode obligatoires', true);
+    busy(t, true);
+    call('suivi', { source: e.source, id: e.id, nom: e.nom, prenom: e.prenom, Paye: $('#fPaye').value, MontantRecu: montant, ModeRecu: mode, Statut: $('#fStatut').value, Notes: $('#fNotes').value })
+      .then(function () {
+        if (addCaisse) return call('ajouterRecette', { mode: mode, montant: String(montant).replace(',', '.'), libelle: e.prenom + ' ' + e.nom });
+      })
+      .then(function () { toast('Suivi enregistré' + (addCaisse ? ' + caisse' : '')); busy(t, false); })
+      .catch(function (err) { busy(t, false); fail(err); });
+  };
+
+  // ---------- aperçu / envoi / modification d'un mail (fiche individuelle, relances, brouillons) ----------
+  // o = { titre, to, sujet, corps, html, draftId?, eleve?: {source,id,type}, retour?: fn }
+  // étiquette de relecture mise par Claude dans l'objet ([À COMPLÉTER], [À RELIRE], [PRÊT]) : elle ne part jamais au destinataire
+  function etiqBadge(e) {
+    if (!e) return '';
+    var t = e.replace(/[\[\]]/g, '').trim();
+    var cls = /relire/i.test(t) ? 'red' : (/compl/i.test(t) ? 'yellow' : 'green');
+    return '<span class="b ' + cls + '">' + esc(t) + '</span> ';
+  }
+  function mailViewer(o) {
+    S.mail = o;
+    openDrawer(o.titre, '<div class="mailhead"><div><span class="muted">À</span> <b>' + esc(o.to || 'pas d\'adresse !') + '</b></div><div><span class="muted">Objet</span> ' + etiqBadge(o.etiquette) + '<b>' + esc(o.sujet) + '</b></div>' +
+      (o.etiquette ? '<div class="small muted">Étiquette mise par Claude, elle est retirée automatiquement à l\'envoi.</div>' : '') + '</div>' +
+      '<iframe class="mailframe" sandbox title="Aperçu du mail"></iframe>' +
+      (o.piecesJointes ? '<p class="small" style="color:var(--red)">Ce brouillon a ' + o.piecesJointes + ' pièce(s) jointe(s) : l\'envoyer ici les garde, mais le modifier ici les enlève (modifie-le dans Gmail).</p>' : '') +
+      '<div class="actions mail-actions"><button class="btn primary big" data-act="mailEnvoyer"' + (o.to ? '' : ' disabled') + '>Envoyer</button>' +
+      '<button class="btn" data-act="mailEditer">Modifier</button>' +
+      (o.draftId ? '<button class="btn danger" data-act="mailSupprimer">Supprimer</button>' : '<button class="btn" data-act="mailBrouillon"' + (o.to ? '' : ' disabled') + '>Garder en brouillon</button>') +
+      (o.retour ? '<button class="btn ghost" data-act="mailRetour">Retour</button>' : '') + '</div>' +
+      // feuilletage : passer d'un mail de relance au suivant sans refermer l'aperçu
+      (o.nav ? '<div class="actions" style="justify-content:space-between;border-top:1px solid var(--line);padding-top:10px;margin-top:4px">' +
+        '<button class="btn sm" data-act="foyerNav" data-f="' + (o.nav.i - 1) + '"' + (o.nav.i <= 0 ? ' disabled' : '') + '>◀ Précédent</button>' +
+        '<span class="muted small">Mail ' + (o.nav.i + 1) + ' sur ' + o.nav.n + '</span>' +
+        '<button class="btn sm" data-act="foyerNav" data-f="' + (o.nav.i + 1) + '"' + (o.nav.i >= o.nav.n - 1 ? ' disabled' : '') + '>Suivant ▶</button></div>' : ''));
+    var fr = $('#drawerBody .mailframe');
+    fr.srcdoc = '<!doctype html><meta charset="utf-8"><base target="_blank"><style>body{margin:0}</style>' + (o.html || '<pre style="white-space:pre-wrap;font:14px Arial;padding:12px">' + esc(o.corps || '') + '</pre>');
+  }
+  function mailEditeur() {
+    var o = S.mail;
+    drawerBody('<form id="fMail"><div class="field"><label>À</label><input name="to" value="' + esc(o.to || '') + '" required></div>' +
+      '<div class="field"><label>Objet</label><input name="sujet" value="' + esc(o.sujet || '') + '" required></div>' +
+      '<div class="field"><label>Message</label><textarea name="corps" rows="14" style="min-height:300px">' + esc(o.corps || '') + '</textarea></div>' +
+      '<p class="muted small">Le logo et la mise en page de la structure sont ajoutés automatiquement.</p>' +
+      '<div class="actions"><button class="btn primary big" type="submit" data-then="envoyer">Envoyer</button>' +
+      '<button class="btn" type="submit" data-then="brouillon">' + (o.draftId ? 'Enregistrer le brouillon' : 'Garder en brouillon') + '</button>' +
+      '<button class="btn ghost" type="button" data-act="mailAnnuler">Annuler</button></div></form>');
+    var f = $('#fMail'), then = 'envoyer';
+    $all('button[type=submit]', f).forEach(function (b) { b.addEventListener('click', function () { then = b.dataset.then; }); });
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      o.to = f.to.value.trim(); o.sujet = f.sujet.value; o.corps = f.corps.value; o.edite = true;
+      mailAction(then, $('button[data-then=' + then + ']', f));
+    });
+  }
+  function mailAction(what, btn) {
+    var o = S.mail;
+    if (what === 'envoyer' && !confirm('Envoyer maintenant ce mail à ' + o.to + ' ?')) return;
+    if (what === 'supprimer' && !confirm('Supprimer ce brouillon ?')) return;
+    busy(btn, true);
+    var pr;
+    if (o.draftId) {
+      if (what === 'supprimer') pr = call('brouillonSupprimer', { id: o.draftId });
+      else if (o.edite) pr = call('brouillonModifier', { id: o.draftId, a: o.to, sujet: o.sujet, corps: o.corps }).then(function () { return what === 'envoyer' ? call('brouillonEnvoyer', { id: o.draftId }) : true; });
+      else pr = what === 'envoyer' ? call('brouillonEnvoyer', { id: o.draftId }) : Promise.resolve(true);
+    } else {
+      var p = { source: o.eleve.source, id: o.eleve.id, type: o.eleve.type };
+      // corpsPret : le texte affiché est déjà le bon (mail de foyer), on l'envoie tel quel
+      if (o.edite || o.corpsPret) { p.to = o.to; p.sujet = o.sujet; p.corps = o.corps; }
+      // mail de famille : la date de relance se note sur tous les enfants du foyer
+      if (o.items && o.items.length) p.items = o.items;
+      pr = call(what === 'envoyer' ? 'envoyerMail' : 'brouillon', p);
+    }
+    pr.then(function () {
+      toast(what === 'envoyer' ? 'Mail envoyé à ' + o.to : (what === 'supprimer' ? 'Brouillon supprimé' : 'Brouillon enregistré dans Gmail'));
+      if (o.retour) o.retour(); else { closeDrawer(); if (S.view === 'mails') go('mails'); }
+    }).catch(function (err) { busy(btn, false); fail(err); });
+  }
+  ACT.mailEnvoyer = function (t) { mailAction('envoyer', t); };
+  ACT.mailBrouillon = function (t) { mailAction('brouillon', t); };
+  ACT.mailSupprimer = function (t) { mailAction('supprimer', t); };
+  ACT.mailEditer = function () { mailEditeur(); };
+  ACT.mailAnnuler = function () { var o = S.mail; o.edite ? mailViewer(Object.assign(o, { html: '' })) : mailViewer(o); };
+  ACT.mailRetour = function () { if (S.mail && S.mail.retour) S.mail.retour(); };
+  // aperçu d'un mail pour un inscrit (confirmation / relance), sans rien créer
+  function apercuEleve(source, id, type, retour) {
+    openDrawer(type === 'relance' ? 'Relance' : 'Confirmation', '<div class="loader"><span></span></div>');
+    return call('apercuMail', { source: source, id: id, type: type }).then(function (m) {
+      mailViewer({ titre: (type === 'relance' ? 'Relance' : 'Confirmation'), to: m.to, sujet: m.sujet, corps: m.corps, html: m.html, eleve: { source: source, id: id, type: type }, retour: retour });
+    }).catch(fail);
+  }
+  ACT.mailApercu = function (t) {
+    var e = S.data.eleve;
+    apercuEleve(e.source, e.id, t.dataset.type, function () { ficheEleve(e.source, e.id); });
+  };
+  ACT.eleveBack = function () { var e = S.data.eleve; ficheEleve(e.source, e.id); };
+
+  // ----- déplacer / retirer / ajouter un cours (réécrit la colonne créneau du Sheet réponses) -----
+  ACT.deplacer = function () {
+    var e = S.data.eleve;
+    drawerBody('<div class="loader"><span></span></div>');
+    call('groupes', { source: e.source }).then(function (gs) {
+      var opts = function (exclure) {
+        return gs.filter(function (g) { return exclure.indexOf(g.cle) < 0; }).map(function (g) { return '<option value="' + esc(g.cle) + '">' + esc(g.label) + '</option>'; }).join('');
+      };
+      var mes = (e.groupes || []).map(function (g) { return g.cle; });
+      var h = '<p class="muted small" style="margin-top:0">Les changements sont écrits directement dans le Sheet réponses (colonne ' + (e.source === 'cours' ? 'Créneau(x)' : 'Stage(s)') + '). Les fiches de présence se recalent toutes seules (1 à 2 min, et chaque matin à 7h).</p>';
+      if (!mes.length) h += '<div class="box alert">Créneau actuel non reconnu : « ' + esc(e.creneaux || e.stage) + ' ». Choisis le bon ci-dessous avec « Ajouter », puis corrige le texte via Modifier les infos si besoin.</div>';
+      (e.groupes || []).forEach(function (g) {
+        h += '<div class="box"><h4>Actuellement</h4><p style="margin:0 0 10px"><b>' + esc(g.label) + '</b></p>' +
+          '<div class="field"><label>Déplacer vers</label><select data-de="' + esc(g.cle) + '" class="selVers">' + opts(mes) + '</select></div>' +
+          '<div class="actions"><button class="btn primary" data-act="deplacerOk" data-de="' + esc(g.cle) + '">Déplacer</button>' +
+          (mes.length > 1 ? '<button class="btn danger" data-act="retirerOk" data-de="' + esc(g.cle) + '">Retirer de ce ' + (e.source === 'cours' ? 'cours' : 'stage') + '</button>' : '') + '</div></div>';
+      });
+      h += '<div class="box"><h4>Ajouter un ' + (e.source === 'cours' ? 'cours' : 'stage') + ' en plus</h4><div class="field"><select id="selAjout">' + opts(mes) + '</select></div><button class="btn" data-act="ajoutGroupeOk">Ajouter</button></div>' +
+        '<button class="btn ghost" data-act="eleveBack">' + ICON.back + 'Retour fiche</button>';
+      drawerBody(h);
+    }).catch(fail);
+  };
+  function apresDeplacement(msg) {
+    var e = S.data.eleve;
+    toast(msg);
+    if (S.view === 'cours' || S.view === 'stages') go(S.view, S.param);
+    ficheEleve(e.source, e.id);
+  }
+  ACT.deplacerOk = function (t) {
+    var e = S.data.eleve, sel = $('select.selVers', t.closest('.box'));
+    if (!sel || !sel.value) return toast('Choisis une destination', true);
+    busy(t, true);
+    call('deplacer', { source: e.source, id: e.id, de: t.dataset.de, vers: sel.value }).then(function () { apresDeplacement('Déplacé, Sheet mis à jour'); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+  ACT.retirerOk = function (t) {
+    var e = S.data.eleve;
+    if (!confirm('Retirer ' + e.prenom + ' de ce ' + (e.source === 'cours' ? 'cours' : 'stage') + ' ? (les autres restent)')) return;
+    busy(t, true);
+    call('deplacer', { source: e.source, id: e.id, de: t.dataset.de, vers: '' }).then(function () { apresDeplacement('Retiré, Sheet mis à jour'); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+  ACT.ajoutGroupeOk = function (t) {
+    var e = S.data.eleve, v = $('#selAjout').value;
+    if (!v) return toast('Rien à ajouter', true);
+    busy(t, true);
+    call('deplacer', { source: e.source, id: e.id, de: '', vers: v }).then(function () { apresDeplacement('Ajouté, Sheet mis à jour'); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+
+  ACT.supprimer = function () {
+    var e = S.data.eleve;
+    drawerBody('<div class="box alert"><h4>Suppression définitive</h4><p>La ligne de <b>' + esc(e.prenom + ' ' + e.nom) + '</b> sera effacée du Sheet réponses (' + (e.source === 'cours' ? 'cours' : 'stages') + ').<br>Pour un simple départ, préfère le statut <b>Désinscrit</b> dans le suivi.</p>' +
+      '<div class="field"><label>Tape SUPPRIMER pour confirmer</label><input id="fConf" autocomplete="off"></div>' +
+      '<div class="actions"><button class="btn primary" data-act="supprimerOk">Supprimer</button><button class="btn" data-act="eleveBack">Annuler</button></div></div>');
+  };
+  ACT.supprimerOk = function (t) {
+    var e = S.data.eleve;
+    if ($('#fConf').value.trim() !== 'SUPPRIMER') return toast('Tape SUPPRIMER en majuscules', true);
+    busy(t, true);
+    call('supprimerInscription', { source: e.source, id: e.id, confirm: 'SUPPRIMER' }).then(function () { toast('Supprimé'); closeDrawer(); go(S.view, S.param); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+
+  // formulaire ajout / modification
+  // menu(s) déroulant(s) pour le cours / stage : plus besoin de retaper les intitulés
+  function selectGroupe(groupes, cle) {
+    return '<div class="row grp-row" style="gap:6px;align-items:center;margin-bottom:6px"><select class="grp-sel" style="flex:1;border:1px solid #ddd2bd;border-radius:10px;padding:10px 12px;min-height:42px;background:#fff">' +
+      '<option value="">Choisir…</option>' + groupes.map(function (g) { return '<option value="' + esc(g.cle) + '"' + (g.cle === cle ? ' selected' : '') + '>' + esc(g.label) + '</option>'; }).join('') +
+      '</select><button type="button" class="btn sm ghost" data-act="grpMoins" aria-label="Retirer">✕</button></div>';
+  }
+  function champGroupes(src, groupes, cles, texteInconnu) {
+    var label = src === 'cours' ? 'Cours' : 'Stage(s)';
+    var h = '<div class="field" id="grpField" data-cles="' + esc(JSON.stringify(cles)) + '"><label>' + label + '</label><div id="grpList">' +
+      (cles.length ? cles : ['']).map(function (c) { return selectGroupe(groupes, c); }).join('') + '</div>' +
+      '<button type="button" class="btn sm" data-act="grpPlus" style="align-self:flex-start">' + ICON.plus + (src === 'cours' ? 'Un autre cours' : 'Un autre stage') + '</button>';
+    if (texteInconnu) h += '<div class="box alert" style="margin-top:8px"><h4>Texte actuel non reconnu</h4><textarea id="grpInconnu" style="width:100%;border:1px solid #ddd2bd;border-radius:10px;padding:8px">' + esc(texteInconnu) + '</textarea><p class="muted small" style="margin:6px 0 0">Choisis le bon cours dans le menu puis vide ce champ, ou garde-le tel quel.</p></div>';
+    return h + '</div>';
+  }
+  ACT.grpPlus = function () {
+    var d = document.createElement('div');
+    d.innerHTML = selectGroupe(S.data.groupes || [], '');
+    $('#grpList').appendChild(d.firstChild);
+  };
+  ACT.grpMoins = function (t) {
+    var rows = $all('#grpList .grp-row');
+    if (rows.length > 1) t.closest('.grp-row').remove(); else $('select', rows[0]).value = '';
+  };
+  function formInscription(src, values, champs, mode, groupes, cles, inconnu) {
+    var long = ['allergies', 'sante', 'urgence', 'autorises', 'adresse', 'commentaire', 'second'];
+    var cleGroupe = src === 'cours' ? 'creneaux' : 'stage';
+    var h = champs.map(function (c) {
+      var v = values[c.key] || '';
+      if (c.key === cleGroupe) return champGroupes(src, groupes, cles, inconnu);
+      if (c.choix && c.choix.length) {
+        var dl = 'dl-' + c.key;
+        return '<div class="field"><label>' + esc(c.label) + '</label><input name="' + c.key + '" list="' + dl + '" value="' + esc(v) + '" placeholder="Choisir ou taper…"><datalist id="' + dl + '">' +
+          c.choix.map(function (x) { return '<option value="' + esc(x) + '">'; }).join('') + '</datalist></div>';
+      }
+      if (c.key === 'naissance' && (!v || /^\d{4}-\d{2}-\d{2}$/.test(frToIso(v)))) return '<div class="field"><label>' + esc(c.label) + '</label><input type="date" name="' + c.key + '" value="' + esc(frToIso(v)) + '"></div>';
+      if (long.indexOf(c.key) >= 0) return '<div class="field"><label>' + esc(c.label) + '</label><textarea name="' + c.key + '">' + esc(v) + '</textarea></div>';
+      return '<div class="field"><label>' + esc(c.label) + '</label><input name="' + c.key + '" value="' + esc(v) + '"></div>';
+    }).join('');
+    return '<form id="fIns" data-mode="' + mode + '" data-src="' + src + '">' + h +
+      '<div class="actions" style="position:sticky;bottom:-18px;background:var(--paper);padding:12px 0"><button class="btn primary" type="submit">' + (mode === 'ajout' ? 'Ajouter dans le Sheet' : 'Enregistrer') + '</button></div></form>';
+  }
+
+  ACT.rattacher = function (t) {
+    var sel = $('.ratSel[data-id="' + t.dataset.id + '"]');
+    if (!sel || !sel.value) { toast('Choisis d\'abord un créneau', true); return; }
+    busy(t, true);
+    call('rattacherCours', { id: t.dataset.id, cle: sel.value }).then(function (r) {
+      toast('Rattaché à ' + r.cle); go('cours');
+    }).catch(function (e) { busy(t, false); fail(e); });
+  };
+  ACT.ajout = function (t) {
+    var src = t.dataset.src, prefill = t.dataset.prefill || '';
+    openDrawer(src === 'cours' ? 'Nouvelle inscription cours' : 'Nouvelle inscription stage', '<div class="loader"><span></span></div>');
+    call('champs', { source: src }).then(function (r) {
+      S.data.groupes = r.groupes;
+      var pre = S.attentePrefill && S.attentePrefill.valeurs || {};
+      drawerBody((S.attentePrefill ? '<p class="small"><span class="b yellow">Liste d\'attente</span> les infos connues sont déjà remplies, la personne passera en « Inscrit » dans la liste.</p>' : '') +
+        '<p class="muted small">Ligne ajoutée directement dans le Sheet réponses. Seuls nom et prénom sont obligatoires.</p>' + formInscription(src, pre, r.champs, 'ajout', r.groupes, prefill ? [prefill] : [], ''));
+      bindInsForm();
+    }).catch(fail);
+  };
+  ACT.modifier = function () {
+    var e = S.data.eleve;
+    drawerBody('<div class="loader"><span></span></div>');
+    call('champs', { source: e.source }).then(function (r) {
+      S.data.groupes = r.groupes;
+      var cles = (e.groupes || []).map(function (g) { return g.cle; });
+      var texte = e.source === 'cours' ? e.creneaux : e.stage;
+      drawerBody(formInscription(e.source, e, r.champs, 'modif', r.groupes, cles, cles.length ? '' : texte));
+      bindInsForm();
+    }).catch(fail);
+  };
+  function bindInsForm() {
+    var f = $('#fIns');
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var fields = {};
+      var modif = f.dataset.mode !== 'ajout';
+      $all('[name]', f).forEach(function (i) { if (!modif || i.value !== i.defaultValue) fields[i.name] = i.value; });
+      // cours / stage choisis dans les menus -> texte exact du Form
+      var gf = $('#grpField', f);
+      if (gf) {
+        var src0 = f.dataset.src, cleG = src0 === 'cours' ? 'creneaux' : 'stage';
+        var choix = [];
+        $all('.grp-sel', f).forEach(function (s) { if (s.value && choix.indexOf(s.value) < 0) choix.push(s.value); });
+        var inc = $('#grpInconnu', f);
+        var avant = JSON.parse(gf.dataset.cles || '[]');
+        var change = choix.slice().sort().join('|') !== avant.slice().sort().join('|') || (inc && inc.value !== inc.defaultValue);
+        if (!modif || change) {
+          var textes = choix.map(function (c) { return (S.data.groupes.filter(function (g) { return g.cle === c; })[0] || {}).form; }).filter(Boolean);
+          if (inc && inc.value.trim()) textes.push(inc.value.trim());
+          if (textes.length || modif) fields[cleG] = textes.join(', ');
+          if (modif && !textes.length) { toast('Choisis au moins un ' + (src0 === 'cours' ? 'cours' : 'stage') + ' (ou utilise Désinscrire)', true); return; }
+        }
+      }
+      if (modif && !Object.keys(fields).length) { toast('Rien de modifié'); return; }
+      var btn = $('button[type=submit]', f); busy(btn, true);
+      var src = f.dataset.src;
+      var p = f.dataset.mode === 'ajout' ? call('ajouterInscription', { source: src, fields: fields })
+        : call('modifierInscription', { source: src, id: S.data.eleve.id, fields: fields });
+      p.then(function (r) {
+        toast('Enregistré');
+        if (S.attentePrefill) { call('statutAttente', { id: S.attentePrefill.id, statut: 'Inscrit' }).catch(function () { }); S.attentePrefill = null; }
+        if (S.view === 'cours' || S.view === 'stages') go(S.view, S.param);
+        ficheEleve(src, r.id);
+      })
+        .catch(function (err) { busy(btn, false); fail(err); });
+    });
+  }
+
+  // ---------- Compta ----------
+  VIEWS.compta = function (el) {
+    return swrN(['compta', 'achats', 'remunerations'], function (r) {
+      var d = r[0], ach = r[1] || { liste: [] }, remu = r[2] || { lignes: [] };
+      var prev = {};
+      (d.synthese || []).forEach(function (x) { prev[x.label] = x.valeur; });
+      S.data.compta = d;
+      var h = '<div class="page-head"><div><h1>Compta</h1><p>Caisse : onglet « ' + esc(d.onglet) + ' » · Prévisionnel : onglet « Synthese » du Modele_economique</p></div><div class="actions">' +
+        '<a class="btn" href="' + esc(safeUrl(d.lien)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Ouvrir le Sheet</a></div></div>';
+      h += '<div class="chips"><a class="chip on" href="#reel" data-act="scrollTo" data-t="reel">Caisse</a><a class="chip" href="#prev" data-act="scrollTo" data-t="prev">Prévisionnel</a></div>';
+      if (d.bloque) h += '<div class="box alert"><h4>Écriture dans la caisse désactivée</h4>' + esc(d.bloque) + '</div>';
+
+      // ----- CAISSE : juste le total, modifiable -----
+      var aj = d.lignes.filter(function (l) { return /^ajustement caisse$/i.test(l.label); })[0];
+      var derniere = aj && aj.note ? aj.note.split('\n').slice(-1)[0] : '';
+      h += '<div id="reel" class="section" style="margin-top:0"><div class="card caisse"><div class="l">Total de la caisse</div>' +
+        '<div class="v' + (d.total < 0 ? ' neg' : '') + '">' + eur(d.total) + '</div>' +
+        (derniere ? '<div class="muted small">Dernière correction : ' + esc(derniere) + '</div>' : '') +
+        '<button class="btn primary big" data-act="modifCaisse"' + (d.bloque ? ' disabled' : '') + '>Modifier le total</button></div>' +
+        '<div class="actions" style="margin-top:12px"><button class="btn" data-act="newDepense"' + (d.bloque ? ' disabled' : '') + '>' + ICON.plus + 'Dépense</button>' +
+        '<button class="btn" data-act="newRecette"' + (d.bloque ? ' disabled' : '') + '>' + ICON.plus + 'Recette</button>' +
+        '<button class="btn dark" data-act="newAchat">' + ICON.plus + 'Facture à payer</button></div>';
+      // détail des lignes : toujours affiché, chaque ligne modifiable
+      h += '<details class="card section detail-compta"' + (S.data.comptaOuvert ? ' open' : '') + '><summary><b>Détail des lignes</b>' +
+        '<span class="resume"><span class="b">total ' + esc(eur(d.total)) + '</span> <span class="b green">recettes ' + esc(eur(d.recettes)) + '</span> <span class="b red">dépenses ' + esc(eur(d.depenses)) + '</span></span></summary>' +
+        '<div class="tscroll" style="margin-top:10px"><table class="t resp"><thead><tr><th>Libellé</th><th>Date</th><th class="num">Montant</th><th>Justif.</th><th></th></tr></thead><tbody>' +
+        d.lignes.concat(d.modes.map(function (m) { m.mode = true; return m; })).map(function (l, i) {
+          return '<tr><td data-l="Libellé"><b>' + esc(l.label) + '</b></td><td data-l="Date">' + esc(l.date || '') + '</td><td data-l="Montant" class="num ' + (l.montant < 0 ? 'neg' : 'pos') + '">' + eur(l.montant) + '</td>' +
+            '<td data-l="Justificatif">' + (l.justificatif ? '<a href="' + esc(safeUrl(l.justificatif)) + '" target="_blank" rel="noopener">voir</a>' : '<span class="muted">-</span>') + '</td>' +
+            '<td><div class="actions" style="justify-content:flex-end;flex-wrap:nowrap"><button class="btn sm" data-act="editLigne" data-i="' + i + '"' + (d.bloque ? ' disabled' : '') + '>Modifier</button>' +
+            (l.mode ? '' : '<button class="btn sm danger" data-act="delLigne" data-row="' + l.row + '" data-label="' + esc(l.label) + '">Suppr.</button>') + '</div></td></tr>';
+        }).join('') + '</tbody></table></div></details></div>';
+      S.data.comptaLignes = d.lignes.concat(d.modes);
+      setTimeout(function () {
+        var dt = $('#view details.detail-compta');
+        if (dt) dt.addEventListener('toggle', function () { S.data.comptaOuvert = dt.open; });
+      }, 0);
+
+      h += sectionAchats(ach);
+      h += sectionRemu(remu);
+
+      // ----- PRÉVISIONNEL -----
+      h += '<div id="prev" class="section"><h2>Prévisionnel 2026-2027</h2>' +
+        '<p class="muted small" style="margin:-6px 0 12px">Calculé dans l\'onglet Synthese du Modele_economique.</p>';
+      var kp = [['Total année (recettes)', 'recettes prévues'], ['À payer aux intervenants', 'rémunération (an)'], ['Charges de structure', 'charges (an)'], ['Résultat net', 'résultat net prévu']];
+      h += '<div class="grid g4">' + kp.map(function (k) { var v = prev[k[0]]; return kpiStatic(v === undefined ? '-' : eur(v), k[1], v < 0 ? 'red' : ''); }).join('') + '</div>';
+      h += blocScenarios(prev, d.synthesePoles);
+      h += blocPoles(d.synthesePoles);
+      if (!d.synthesePoles && !Object.keys(prev).length) h += '<div class="empty">Onglet Synthese introuvable.</div>';
+      h += '</div>';
+
+      if (d.factures.length) h += '<div class="section"><h2>Factures en attente</h2><div class="card"><div class="list">' + d.factures.map(function (f) {
+        return '<div class="li"><span class="b yellow">' + esc(f.Numero) + '</span><div class="main"><div class="t">' + esc(f.Client) + '</div><div class="s">échéance ' + esc(f.Echeance) + '</div></div><b>' + eur(f.Montant) + '</b></div>';
+      }).join('') + '</div></div></div>';
+      el.innerHTML = h;
+    });
+  };
+  ACT.scrollTo = function (t) {
+    var target = document.getElementById(t.dataset.t);
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    $all('.chips .chip').forEach(function (c) { c.classList.toggle('on', c === t); });
+  };
+  // un bloc de l'onglet Synthese (valeurs telles qu'affichées dans le Sheet)
+  // Trois scenarios cote a cote : le reve (7 eleves partout), le previsionnel, le reel a ce jour.
+  // Les chiffres viennent tels quels de l'onglet Synthese, rien n'est recalcule ici.
+  function blocScenarios(prev, poles) {
+    var optRec = null;
+    if (poles && poles.total && poles.entetes) {
+      poles.entetes.forEach(function (e, i) {
+        if (i > 0 && /previ|optimal/i.test(e) && poles.total.nums[i] !== null) optRec = poles.total.nums[i];
+      });
+    }
+    var cols = [
+      { t: 'Si 7 inscrits partout', rec: optRec, remu: prev['Rémunération potentielle'], ch: prev['Charges de structure'], res: prev['Résultat si 7 élèves partout'] },
+      { t: 'Prévisionnel', rec: prev['Total année (recettes)'], remu: prev['À payer aux intervenants'], ch: prev['Charges de structure'], res: prev['Résultat net'] },
+      { t: 'Réel à ce jour', rec: prev['Total encaissé à ce jour'], remu: prev['À payer aux intervenants'], ch: prev['Charges réelles'], res: prev['Résultat net réel'] }
+    ];
+    if (!cols.some(function (c) { return c.res !== undefined; })) return '';
+    var cell = function (v, abs) {
+      if (v === undefined || v === null) return '<td class="num muted">-</td>';
+      if (abs) v = Math.abs(v);
+      return '<td class="num' + (v < 0 ? ' neg' : '') + '">' + eur(v) + '</td>';
+    };
+    // les charges sont saisies en négatif dans le Sheet : on les affiche en positif, la ligne dit déjà que c'est une charge
+    var ligne = function (lib, k, gras, abs) {
+      return '<tr' + (gras ? ' style="font-weight:700"' : '') + '><td>' + lib + '</td>' + cols.map(function (c) { return cell(c[k], abs); }).join('') + '</tr>';
+    };
+    return '<div class="card section"><h3>Les trois scénarios de la saison</h3>' +
+      '<div class="tscroll"><table class="t"><thead><tr><th></th>' + cols.map(function (c) { return '<th class="num">' + esc(c.t) + '</th>'; }).join('') + '</tr></thead><tbody>' +
+      ligne('Recettes', 'rec') + ligne('Rémunération des intervenants', 'remu') + ligne('Charges de structure', 'ch', false, true) + ligne('Résultat', 'res', true) +
+      '</tbody></table></div>' +
+      '<p class="muted small" style="margin:8px 0 0">Les charges de structure sont ramenées au total, le détail poste par poste se lit dans le Sheet. La rémunération par intervenant est dans le bloc du dessus.</p></div>';
+  }
+
+  // Le tableau des poles de la Synthese, le seul qu'on recopie encore
+  function blocPoles(p) {
+    if (!p) return '';
+    var ligne = function (o, gras) {
+      return '<tr' + (gras ? ' style="font-weight:700"' : '') + '>' + o.cells.map(function (v, c) {
+        var n = o.nums[c];
+        var cls = c > 0 ? 'num' + ((n !== null && n < 0) || /^\(|^-\d/.test(v) ? ' neg' : '') : '';
+        return '<td' + (cls ? ' class="' + cls + '"' : '') + ' data-l="' + esc(p.entetes[c] || '') + '">' + esc(v) + '</td>';
+      }).join('') + '</tr>';
+    };
+    return '<div class="card section"><h3>Par pôle d\'activité</h3><div class="tscroll"><table class="t resp"><thead><tr>' +
+      p.entetes.map(function (e, i) { return '<th' + (i ? ' class="num"' : '') + '>' + esc(e) + '</th>'; }).join('') +
+      '</tr></thead><tbody>' + p.lignes.map(function (l) { return ligne(l); }).join('') + (p.total ? ligne(p.total, true) : '') +
+      '</tbody></table></div></div>';
+  }
+
+  ACT.editLigne = function (t) {
+    var l = S.data.comptaLignes[+t.dataset.i];
+    if (!l) return;
+    var mode = !!l.mode;
+    openDrawer('Modifier : ' + l.label, '<form id="fLigne">' +
+      (mode ? '<p class="muted small" style="margin-top:0">Total encaissé en ' + esc(l.label) + '. L\'ancienne valeur est gardée en note dans le Sheet.</p>' :
+        '<div class="field"><label>Libellé</label><input name="libelle" required value="' + esc(l.label) + '"></div>' +
+        '<div class="field"><label>Type</label><select name="sens"><option value="depense"' + (l.montant < 0 ? ' selected' : '') + '>Dépense (sortie)</option><option value="entree"' + (l.montant >= 0 ? ' selected' : '') + '>Entrée</option></select></div>') +
+      '<div class="row"><div class="field"><label>Montant (€)</label><input name="montant" inputmode="decimal" required value="' + esc(String(Math.abs(l.montant)).replace('.', ',')) + '"></div>' +
+      '<div class="field"><label>Date</label><input type="date" name="date" value="' + esc(frToIso(l.date || '')) + '"></div></div>' +
+      '<button class="btn primary big" type="submit" style="width:100%">Enregistrer</button></form>');
+    var f = $('#fLigne');
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = f.querySelector('button[type=submit]'); busy(b, true);
+      call('modifierLigneCompta', { row: l.row, label: l.label, libelle: f.libelle ? f.libelle.value : l.label, sens: f.sens ? f.sens.value : 'entree', montant: f.montant.value, date: f.date.value })
+        .then(function () { closeDrawer(); toast('Ligne modifiée'); go('compta'); })
+        .catch(function (e) { busy(b, false); fail(e); });
+    });
+  };
+  ACT.modifCaisse = function () {
+    var d = S.data.compta || { total: 0 };
+    openDrawer('Total de la caisse', '<form id="fCaisse"><p class="muted small" style="margin-top:0">Actuellement : <b>' + eur(d.total) + '</b>. Tape le montant réel, l\'ERP met l\'écart sur une ligne « Ajustement caisse » (le Total et la Synthese suivent).</p>' +
+      '<div class="field"><label>Nouveau total (€)</label><input name="total" inputmode="decimal" required value="' + esc(String(d.total).replace('.', ',')) + '" style="font-size:24px;font-weight:700"></div>' +
+      '<div class="field"><label>D\'où vient l\'info ? (facultatif)</label><input name="raison" placeholder="Ex : comptage Alex après le stage"></div>' +
+      '<button class="btn primary big" type="submit" style="width:100%">Enregistrer</button></form>');
+    var f = $('#fCaisse');
+    setTimeout(function () { f.total.focus(); f.total.select(); }, 60);
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = f.querySelector('button[type=submit]'); busy(b, true);
+      call('modifierCaisse', { total: String(f.total.value).replace(/\s/g, '').replace(',', '.'), raison: f.raison.value }).then(function (r) {
+        closeDrawer(); toast(r.ecart ? 'Caisse mise à jour : ' + eur(r.total) : 'Pas de changement'); go('compta');
+      }).catch(function (e) { busy(b, false); fail(e); });
+    });
+  };
+  ACT.newDepense = function () {
+    var qui = (S.data.achats && S.data.achats.beneficiaires) || [];
+    openDrawer('Nouvelle dépense', '<form id="fDep">' +
+      (qui.length ? '<div class="field"><label>Paiement d\'un intervenant ? (facultatif)</label><select id="depQui"><option value="">Non, autre dépense</option>' +
+        qui.map(function (o) { return '<option>' + esc(o) + '</option>'; }).join('') + '</select></div>' : '') +
+      '<div class="field"><label>Libellé</label><input name="libelle" required placeholder="Ex : Matos : massues"></div>' +
+      '<div class="row"><div class="field"><label>Montant (€)</label><input name="montant" inputmode="decimal" required></div><div class="field"><label>Date</label><input type="date" name="date" value="' + todayIso() + '"></div></div>' +
+      '<div class="field"><label>Justificatif (photo ou PDF)</label><input type="file" id="fFile" accept="image/*,application/pdf"></div>' +
+      '<p class="muted small">Ligne insérée au-dessus de "Cash" dans le tableau de caisse, avec la date et le lien du justificatif à droite.</p>' +
+      '<button class="btn primary" type="submit">Ajouter la dépense</button></form>');
+    if ($('#depQui')) $('#depQui').addEventListener('change', function () {
+      var f = $('#fDep');
+      if (this.value) f.libelle.value = this.value + ' · rémunération';
+      f.libelle.focus();
+    });
+    $('#fDep').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var f = ev.target, btn = $('button[type=submit]', f); busy(btn, true);
+      var file = $('#fFile').files[0];
+      var up = file ? readFile(file).then(function (b64) { return call('uploadJustificatif', { name: file.name, mime: file.type, data: b64 }); }) : Promise.resolve(null);
+      up.then(function (u) {
+        return call('ajouterDepense', { libelle: f.libelle.value, montant: f.montant.value.replace(',', '.'), date: f.date.value, justificatif: u ? u.url : '' });
+      }).then(function () { toast('Dépense ajoutée'); closeDrawer(); go('compta'); }).catch(function (err) { busy(btn, false); fail(err); });
+    });
+  };
+  function readFile(file) {
+    return new Promise(function (res, rej) {
+      if (file.size > 15 * 1024 * 1024) return rej(new Error('Fichier trop lourd (15 Mo max)'));
+      var r = new FileReader();
+      r.onload = function () { res(String(r.result).split(',')[1]); };
+      r.onerror = function () { rej(new Error('Lecture du fichier impossible')); };
+      r.readAsDataURL(file);
+    });
+  }
+  ACT.newRecette = function () {
+    openDrawer('Nouvelle recette', '<form id="fRec"><div class="row"><div class="field"><label>Mode</label><select name="mode"><option>Virement</option><option>Chèque</option><option>Cash</option></select></div>' +
+      '<div class="field"><label>Montant (€)</label><input name="montant" inputmode="decimal" required></div></div>' +
+      '<div class="row"><div class="field"><label>Libellé (pour la note)</label><input name="libelle" placeholder="Ex : Cotisation Dupont"></div><div class="field"><label>Date</label><input type="date" name="date" value="' + todayIso() + '"></div></div>' +
+      '<p class="muted small">Le montant s\'ajoute à la ligne du mode (la cellule garde l\'historique : =1000+300) avec une note datée. Montant négatif pour corriger.</p>' +
+      '<button class="btn primary" type="submit">Ajouter</button></form>');
+    $('#fRec').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var f = ev.target, btn = $('button[type=submit]', f); busy(btn, true);
+      call('ajouterRecette', { mode: f.mode.value, montant: f.montant.value.replace(',', '.'), libelle: f.libelle.value, date: f.date.value })
+        .then(function () { toast('Recette ajoutée'); closeDrawer(); go('compta'); }).catch(function (err) { busy(btn, false); fail(err); });
+    });
+  };
+  ACT.delLigne = function (t) {
+    if (!confirm('Supprimer la ligne "' + t.dataset.label + '" du tableau de caisse ?')) return;
+    busy(t, true);
+    call('supprimerLigneCompta', { row: t.dataset.row, label: t.dataset.label }).then(function () { toast('Ligne supprimée'); go('compta'); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+
+  // ---------- Rémunération des intervenants : qui est payé, sur quoi, combien ----------
+  function sectionRemu(R) {
+    S.data.remu = R;
+    if (!R || !R.pret) {
+      return '<div class="section"><h2>Rémunération des intervenants</h2><div class="card"><div class="empty">' +
+        'Le modèle économique n\'est pas encore préparé. Dans le classeur ERP, menu <b>ERP &gt; Mettre à jour le modèle économique</b>, une seule fois.</div></div></div>';
+    }
+    var l = R.lignes || [];
+    var h = '<div class="section"><h2>Rémunération des intervenants</h2>' +
+      '<div class="grid g3">' + kpiStatic(eur(R.total), 'à payer sur la saison', R.total ? 'yellow' : '') +
+      kpiStatic(eur(R.parMois), 'par mois, tous ensemble') +
+      kpiStatic(eur(R.potentiel), 'si tout le monde était payé') + '</div>';
+    h += '<div class="grid g3" style="align-items:start">' + l.map(function (g, i) {
+      var natures = [['Activité', g.payeActivite, g.activite], ['Admin', g.payeAdmin, g.admin], ['Technique', g.payeTech, g.technique]];
+      return '<div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">' +
+        '<b style="font-family:var(--head);font-size:17px">' + esc(g.nom) + '</b>' +
+        '<span class="b ' + (g.total ? 'green' : 'dark') + '">' + (g.total ? 'payé' : 'bénévole') + '</span></div>' +
+        '<div class="v" style="font-family:var(--head);font-size:26px;margin:6px 0 2px">' + eur(g.total) + '</div>' +
+        '<div class="muted small">' + eur(g.parMois) + ' par mois · objectif ' + eur(g.objectif) +
+        ' · écart <b class="' + (g.ecart < 0 ? 'neg' : '') + '">' + eur(g.ecart) + '</b></div>' +
+        '<dl class="kv" style="margin-top:8px">' + natures.map(function (n) {
+          return '<dt>' + n[0] + (n[1] ? '' : ' <span class="muted">(off)</span>') + '</dt><dd>' + (n[1] ? eur(n[2]) : '-') + '</dd>';
+        }).join('') + '</dl>' +
+        (g.potentiel > g.total ? '<div class="muted small">Potentiel si tout activé : ' + eur(g.potentiel) + '</div>' : '') +
+        '<div class="actions" style="margin-top:10px"><button class="btn sm" data-act="remuEdit" data-i="' + i + '">Modifier</button></div></div>';
+    }).join('') + '</div>';
+    h += '<p class="muted small">Les heures se comptent en heures réelles, 1 séance vaut 2 h. Ce qui est décoché n\'est pas compté dans la compta, mais reste affiché en potentiel.</p></div>';
+    return h;
+  }
+  ACT.remuEdit = function (t) {
+    var g = ((S.data.remu || {}).lignes || [])[+t.dataset.i];
+    if (!g) return;
+    var sw = function (id, lab, on, detail) {
+      return '<label class="box" style="display:block;margin-bottom:8px;cursor:pointer"><span class="row" style="justify-content:space-between;align-items:center">' +
+        '<b>' + lab + '</b><input type="checkbox" id="' + id + '"' + (on ? ' checked' : '') + ' style="width:22px;height:22px"></span>' +
+        '<span class="muted small">' + detail + '</span></label>';
+    };
+    openDrawer('Rémunération de ' + g.nom, '<form id="fRemu">' +
+      '<p class="muted small" style="margin-top:0">Décoche une nature pour que la personne travaille sans être facturée. Sa fiche continue d\'afficher ce qu\'elle toucherait.</p>' +
+      sw('rActivite', "Payé sur l'activité", g.payeActivite, 'Cours, stages et prestations où son nom est saisi dans le modèle économique. Actuellement ' + eur(g.cours + g.presta + g.stages) + ' par an.') +
+      sw('rAdmin', 'Payé sur l\'admin / com / dev', g.payeAdmin, 'Gestion, inscriptions, site, outils.') +
+      sw('rTech', 'Payé sur la technique', g.payeTech, 'Réparation, aménagement, optimisation du lieu.') +
+      '<div class="row"><div class="field"><label>Heures admin par mois</label><input id="rHAdmin" inputmode="decimal" value="' + esc(g.hAdmin) + '"></div>' +
+      '<div class="field"><label>Heures technique par mois</label><input id="rHTech" inputmode="decimal" value="' + esc(g.hTech) + '"></div></div>' +
+      '<div class="row"><div class="field"><label>Heures d\'activité en plus sur l\'année</label><input id="rHActivite" inputmode="decimal" value="' + esc(g.hActivite) + '"></div>' +
+      '<div class="field"><label>Objectif mensuel (€)</label><input id="rObj" inputmode="decimal" value="' + esc(g.objectif) + '"></div>' +
+      '<div class="field"><label>Mois de lissage</label><input id="rMois" inputmode="numeric" value="' + esc(g.mois) + '"></div></div>' +
+      '<p id="rApercu" class="muted small"></p>' +
+      '<button class="btn primary big" type="submit" style="width:100%">Enregistrer</button></form>');
+    var f = $('#fRemu');
+    var tarif = 30;
+    function apercu() {
+      var activite = $('#rActivite').checked ? (g.cours + g.presta + g.stages + (Number($('#rHActivite').value.replace(',', '.')) || 0) / 2 * tarif) : 0;
+      var admin = $('#rAdmin').checked ? (Number($('#rHAdmin').value.replace(',', '.')) || 0) / 2 * tarif * (Number($('#rMois').value) || 12) : 0;
+      var tech = $('#rTech').checked ? (Number($('#rHTech').value.replace(',', '.')) || 0) / 2 * tarif * (Number($('#rMois').value) || 12) : 0;
+      var tot = activite + admin + tech, mois = Number($('#rMois').value) || 12;
+      $('#rApercu').innerHTML = 'Estimation : <b>' + eur(tot) + '</b> sur l\'année, soit ' + eur(tot / mois) + ' par mois. Le chiffre exact est recalculé par le classeur après enregistrement.';
+    }
+    f.addEventListener('input', apercu); f.addEventListener('change', apercu); apercu();
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = f.querySelector('button[type=submit]'); busy(b, true);
+      call('saveRemuneration', {
+        nom: g.nom, payeActivite: $('#rActivite').checked, payeAdmin: $('#rAdmin').checked, payeTech: $('#rTech').checked,
+        hAdmin: $('#rHAdmin').value.replace(',', '.'), hTech: $('#rHTech').value.replace(',', '.'), hActivite: $('#rHActivite').value.replace(',', '.'),
+        objectif: $('#rObj').value.replace(',', '.'), mois: $('#rMois').value
+      }).then(function () { toast('Rémunération mise à jour'); closeDrawer(); go('compta'); })
+        .catch(function (e) { busy(b, false); fail(e); });
+    });
+  };
+
+  // ---------- Devis & factures ----------
+  VIEWS.factures = function (el) {
+    return swrN(['factures', 'dossierDevis', 'achats'], function (r) {
+      var list = r[0], fichiers = r[1] || [], ach = r[2] || { liste: [] };
+      S.data.factures = list;
+      var h = '<div class="page-head"><div><h1>Devis & factures</h1><p>PDF rangés dans le dossier Devis / Facture du Drive (DEV-2026-002_Client.pdf, FAC-2026-001_Client.pdf)</p></div>' +
+        '<div class="actions"><button class="btn" data-act="newFacture" data-type="devis">' + ICON.plus + 'Nouveau devis</button><button class="btn primary" data-act="newFacture" data-type="facture">' + ICON.plus + 'Nouvelle facture</button></div></div>';
+      h += '<div class="card">' + (list.length ? '<div class="tscroll"><table class="t resp"><thead><tr><th>N°</th><th>Client</th><th>Date</th><th class="num">Montant</th><th>Statut</th><th></th></tr></thead><tbody>' + list.map(function (f) {
+        var devis = f.Type === 'Devis';
+        var cls = { 'Payée': 'green', 'Accepté': 'green', 'Facturé': 'green', 'Émise': 'yellow', 'Envoyé': 'yellow', 'Annulée': 'dark', 'Refusé': 'dark', 'Envoyée': 'blue' }[f.Statut] || '';
+        var btns = '';
+        if (devis && ['Refusé', 'Facturé'].indexOf(f.Statut) < 0) btns += (f.Statut !== 'Accepté' ? '<button class="btn sm" data-act="factStatut" data-id="' + esc(f.ID) + '" data-s="Accepté">Accepté</button><button class="btn sm ghost" data-act="factStatut" data-id="' + esc(f.ID) + '" data-s="Refusé">Refusé</button>' : '') +
+          '<button class="btn sm primary" data-act="devisVersFacture" data-id="' + esc(f.ID) + '">Facturer</button>';
+        if (!devis && f.Statut !== 'Payée' && f.Statut !== 'Annulée') btns += '<button class="btn sm" data-act="factStatut" data-id="' + esc(f.ID) + '" data-s="Envoyée">Envoyée</button><button class="btn sm primary" data-act="factPayee" data-id="' + esc(f.ID) + '">Payée</button>';
+        return '<tr><td data-l="N°"><span class="b ' + (devis ? 'blue' : 'dark') + '">' + (devis ? 'Devis' : 'Facture') + '</span> <b>' + esc(f.Numero) + '</b></td><td data-l="Client">' + esc(f.Client) + '<div class="muted small">' + esc(f.Objet) + '</div></td><td data-l="Date">' + esc(f.Date) + '</td><td data-l="Montant" class="num">' + eur(f.Montant) + '</td>' +
+          '<td data-l="Statut"><span class="b ' + cls + '">' + esc(f.Statut) + '</span></td><td><div class="actions" style="justify-content:flex-end">' +
+          (f.LienPdf ? '<a class="btn sm" href="' + esc(safeUrl(f.LienPdf)) + '" target="_blank" rel="noopener">PDF</a>' : '') + (f.LienDoc ? '<a class="btn sm" href="' + esc(safeUrl(f.LienDoc)) + '" target="_blank" rel="noopener">Doc</a>' : '') +
+          btns + '</div></td></tr>';
+      }).join('') + '</tbody></table></div>' : '<div class="empty">Aucun devis ni facture pour l\'instant.</div>') + '</div>';
+      h += sectionAchats(ach);
+      // ce qui est réellement dans le dossier Drive (y compris les devis faits à la main)
+      var devis = fichiers.filter(function (f) { return f.type === 'Devis'; });
+      h += '<div class="section"><h2>Dossier Drive · devis <span class="b">' + devis.length + '</span></h2><div class="card">' +
+        (fichiers.length ? '<div class="list">' + fichiers.map(function (f) {
+          return '<a class="li click" href="' + esc(safeUrl(f.url)) + '" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">' +
+            '<span class="b ' + (f.type === 'Devis' ? 'blue' : 'dark') + '">' + esc(f.type) + '</span>' +
+            '<div class="main"><div class="t">' + esc(f.nom) + '</div><div class="s">' + esc(f.date + (f.statut ? ' · ' + f.statut : ' · pas encore suivi dans l\'ERP')) + '</div></div>' + ICON.ext + '</a>';
+        }).join('') + '</div>' : '<div class="muted">Dossier vide ou inaccessible.</div>') + '</div></div>';
+      el.innerHTML = h;
+    });
+  };
+  ACT.devisVersFacture = function (t) {
+    var d = (S.data.factures || []).filter(function (x) { return String(x.ID) === t.dataset.id; })[0];
+    if (!d) return;
+    var det = {}; try { det = JSON.parse(d.Details || '{}'); } catch (e) { det = {}; }
+    formFacture('facture', { client: d.Client, service: det.service, adresse: det.adresse, cpVille: det.cpVille, siret: det.siret, engagement: det.engagement, periode: det.periode, nomCourt: det.nomCourt, lignes: det.lignes, depuisDevis: d.ID, numDevis: d.Numero });
+  };
+  ACT.newFacture = function (t) { formFacture(t.dataset.type === 'devis' ? 'devis' : 'facture', {}); };
+  function formFacture(type, v) {
+    var devis = type === 'devis';
+    openDrawer(devis ? 'Nouveau devis' : 'Nouvelle facture' + (v.numDevis ? ' (devis ' + v.numDevis + ')' : ''), '<form id="fFact">' +
+      '<div class="field"><label>Client (collectivité, école...)</label><input name="client" required placeholder="Mairie de Villeneuve" value="' + esc(v.client || '') + '"></div>' +
+      '<div class="field"><label>Nom court pour le fichier</label><input name="nomCourt" placeholder="Villeneuve" value="' + esc(v.nomCourt || '') + '"><p class="muted small" style="margin:4px 0 0">Fichier : <b id="factNom"></b></p></div>' +
+      '<div class="row"><div class="field"><label>Service</label><input name="service" placeholder="Service Enfance" value="' + esc(v.service || '') + '"></div><div class="field"><label>SIRET client</label><input name="siret" value="' + esc(v.siret || '') + '"></div></div>' +
+      '<div class="field"><label>Adresse</label><input name="adresse" value="' + esc(v.adresse || '') + '"></div>' +
+      '<div class="row"><div class="field"><label>CP et ville</label><input name="cpVille" value="' + esc(v.cpVille || '') + '"></div><div class="field"><label>N° engagement / bon de commande</label><input name="engagement" value="' + esc(v.engagement || '') + '"></div></div>' +
+      '<div class="row"><div class="field"><label>Période de la prestation</label><input name="periode" placeholder="novembre-décembre 2026" value="' + esc(v.periode || '') + '"></div><div class="field"><label>Date</label><input type="date" name="date" value="' + todayIso() + '"></div></div>' +
+      (devis ? '<div class="field"><label>Conditions (facultatif, sinon texte standard)</label><textarea name="conditions" placeholder="Lieu, effectif, annulation..."></textarea></div>' : '') +
+      '<div class="hr"></div><div id="lignes"></div><button class="btn sm" type="button" data-act="factLigne">' + ICON.plus + 'Ligne</button>' +
+      '<p id="factTotal" style="font-family:var(--head);font-size:22px;margin:14px 0"></p>' +
+      '<button class="btn primary big" type="submit" style="width:100%">Générer ' + (devis ? 'le devis' : 'la facture') + ' (Doc + PDF)</button></form>');
+    (v.lignes && v.lignes.length ? v.lignes : [{ designation: "Séance d'initiation, intervention sur site", detail: 'Groupe de 12 personnes, 1h30, deux intervenants diplômés, matériel compris', qte: 6, pu: 180 }]).forEach(addLigne);
+    var f = $('#fFact');
+    function nomFichier() {
+      var src = (f.nomCourt.value || f.client.value || 'Client').trim()
+        .replace(/^(mairie|commune|ville|ecole|école|groupe scolaire|college|collège|centre de loisirs|accueil de loisirs|association|communauté de communes)\s+(de\s+la\s+|de\s+l'|du\s+|des\s+|de\s+|d')?/i, '');
+      $('#factNom').textContent = (devis ? 'DEV-' : 'FAC-') + 'AAAA-NNN_' + src.replace(/['’]/g, '-').replace(/\s+/g, '-') + '.pdf';
+    }
+    f.addEventListener('input', function () { factTotal(); nomFichier(); });
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var btn = $('button[type=submit]', f); busy(btn, true);
+      var lignes = $all('.fl', f).map(function (x) { return { designation: $('[data-k=designation]', x).value, detail: $('[data-k=detail]', x).value, qte: $('[data-k=qte]', x).value.replace(',', '.'), pu: $('[data-k=pu]', x).value.replace(',', '.') }; });
+      call('creerFacture', { type: type, client: f.client.value, nomCourt: f.nomCourt.value, service: f.service.value, adresse: f.adresse.value, cpVille: f.cpVille.value, siret: f.siret.value, engagement: f.engagement.value, periode: f.periode.value, date: f.date.value,
+        conditions: f.conditions ? f.conditions.value : '', depuisDevis: v.depuisDevis || '', lignes: lignes })
+        .then(function (r) {
+          drawerBody('<div class="box"><h4>' + (devis ? 'Devis ' : 'Facture ') + esc(r.numero) + ' créé' + (devis ? '' : 'e') + '</h4><p>' + esc(r.fichier) + ' · total ' + eur(r.total) + '</p><div class="actions"><a class="btn primary" href="' + esc(safeUrl(r.pdf)) + '" target="_blank" rel="noopener">Ouvrir le PDF</a><a class="btn" href="' + esc(safeUrl(r.doc)) + '" target="_blank" rel="noopener">Retoucher le Doc</a></div><p class="muted small">Si tu retouches le Doc, refais le PDF depuis Docs (Fichier > Télécharger > PDF) et remplace celui du dossier.</p></div>');
+          if (S.view === 'factures') VIEWS.factures($('#view'));
+        }).catch(function (err) { busy(btn, false); fail(err); });
+    });
+    factTotal(); nomFichier();
+  }
+  function addLigne(l) {
+    l = l || {};
+    var d = document.createElement('div');
+    d.className = 'fl box';
+    d.innerHTML = '<div class="field"><label>Désignation</label><input data-k="designation" value="' + esc(l.designation || '') + '"></div><div class="field"><label>Détail (petit texte)</label><input data-k="detail" value="' + esc(l.detail || '') + '"></div>' +
+      '<div class="row"><div class="field"><label>Qté</label><input data-k="qte" inputmode="decimal" value="' + esc(l.qte || 1) + '"></div><div class="field"><label>Prix unitaire (€)</label><input data-k="pu" inputmode="decimal" value="' + esc(l.pu || '') + '"></div></div>';
+    $('#lignes').appendChild(d);
+  }
+  ACT.factLigne = function () { addLigne(); factTotal(); };
+  function factTotal() {
+    var tot = $all('.fl').reduce(function (a, x) { return a + (Number($('[data-k=qte]', x).value.replace(',', '.')) || 0) * (Number($('[data-k=pu]', x).value.replace(',', '.')) || 0); }, 0);
+    var el = $('#factTotal'); if (el) el.textContent = 'Total : ' + eur(tot);
+  }
+  ACT.factStatut = function (t) {
+    busy(t, true);
+    call('statutFacture', { id: t.dataset.id, statut: t.dataset.s }).then(function () { toast('Statut mis à jour'); go('factures'); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+  ACT.factPayee = function (t) {
+    var add = confirm('Facture payée. Ajouter aussi le montant dans la caisse (ligne Virement) ?');
+    busy(t, true);
+    call('statutFacture', { id: t.dataset.id, statut: 'Payée', ajouterCaisse: add, mode: 'Virement' }).then(function () { toast('Facture payée' + (add ? ' + caisse' : '')); go('factures'); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+
+  // ---------- Factures à payer : intervenants, auto-entreprise, fournisseurs ----------
+  // Une facture payée peut être écrite directement dans la caisse (dépense réelle).
+  function sectionAchats(a) {
+    S.data.achats = a;
+    var l = a.liste || [];
+    var h = '<div class="section"><h2>Factures à payer' + (a.nbAPayer ? ' <span class="b yellow">' + a.nbAPayer + '</span>' : '') + '</h2>' +
+      '<div class="grid g3">' + kpiStatic(eur(a.aPayer || 0), 'à payer', a.aPayer ? 'yellow' : '') +
+      kpiStatic(a.retards || 0, 'en retard', a.retards ? 'red' : '') + kpiStatic(eur(a.payeTotal || 0), 'déjà payé') + '</div>';
+    h += '<div class="card"><div class="actions" style="margin-bottom:12px"><button class="btn primary" data-act="newAchat">' + ICON.plus + 'Facture à payer</button></div>';
+    h += l.length ? '<div class="tscroll"><table class="t resp"><thead><tr><th>Qui</th><th>Objet</th><th>Échéance</th><th class="num">Montant</th><th>Statut</th><th></th></tr></thead><tbody>' +
+      l.map(function (r, i) {
+        var cls = r.paye ? 'green' : (r.retard ? 'red' : 'yellow');
+        return '<tr><td data-l="Qui"><b>' + esc(r.Beneficiaire) + '</b><div class="muted small">' + esc(r.Type || '') + '</div></td>' +
+          '<td data-l="Objet">' + esc(r.Objet || '') + ((r.pieces || []).length ? ' ' + r.pieces.map(function (u, n) {
+            return '<a href="' + esc(safeUrl(u)) + '" target="_blank" rel="noopener">' + (r.pieces.length > 1 ? 'pièce ' + (n + 1) : 'justif.') + '</a>';
+          }).join(' ') : '') + '</td>' +
+          '<td data-l="Échéance">' + esc(r.Echeance || r.Date || '') + '</td>' +
+          '<td data-l="Montant" class="num">' + eur(r.montant) + '</td>' +
+          '<td data-l="Statut"><span class="b ' + cls + '">' + esc(r.paye ? 'Payée le ' + (r.PayeLe || '') : (r.retard ? 'En retard' : 'À payer')) + '</span></td>' +
+          '<td><div class="actions" style="justify-content:flex-end;flex-wrap:nowrap">' +
+          (r.paye ? '' : '<button class="btn sm primary" data-act="achatPayer" data-i="' + i + '">Payer</button>') +
+          '<button class="btn sm ghost" data-act="achatEdit" data-i="' + i + '">✎</button>' +
+          '<button class="btn sm ghost danger" data-act="achatSuppr" data-id="' + esc(r.ID) + '">✕</button></div></td></tr>';
+      }).join('') + '</tbody></table></div>' : '<div class="empty">Rien à payer pour l\'instant.</div>';
+    return h + '<p class="muted small">Rémunérations des intervenants, factures auto-entreprise, fournisseurs. Noté dans l\'onglet <b>Achats</b> du classeur ERP. Le bouton Payer peut écrire la dépense dans la caisse.</p></div></div>';
+  }
+  function formAchat(v) {
+    v = v || {};
+    var a = S.data.achats || { beneficiaires: [] };
+    var qui = (a.beneficiaires || []).slice();
+    if (v.Beneficiaire && qui.indexOf(v.Beneficiaire) < 0) qui.push(v.Beneficiaire);
+    openDrawer(v.ID ? 'Modifier la facture à payer' : 'Nouvelle facture à payer', '<form id="fAchat">' +
+      '<div class="row"><div class="field"><label>Qui doit être payé</label><select name="Beneficiaire" id="aQui">' +
+      qui.map(function (o) { return '<option' + (v.Beneficiaire === o ? ' selected' : '') + '>' + esc(o) + '</option>'; }).join('') +
+      '<option value="__autre">Autre (à taper)</option></select></div>' +
+      '<div class="field"><label>Type</label><select name="Type">' + ['Intervenant', 'Auto-entreprise', 'Fournisseur', 'Autre'].map(function (o) { return '<option' + ((v.Type || 'Intervenant') === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select></div></div>' +
+      '<div class="field" id="aAutreBox" hidden><label>Nom</label><input name="Autre" placeholder="Ex : Association X"></div>' +
+      '<div class="field"><label>Objet</label><input name="Objet" placeholder="Ex : cours du mardi, octobre 2026" value="' + esc(v.Objet || '') + '"></div>' +
+      '<div class="row"><div class="field"><label>Montant (€)</label><input name="Montant" inputmode="decimal" required value="' + esc(v.Montant !== undefined ? String(v.Montant).replace('.', ',') : '') + '"></div>' +
+      '<div class="field"><label>Date de la facture</label><input type="date" name="Date" value="' + esc(frToIso(v.Date || '') || todayIso()) + '"></div>' +
+      '<div class="field"><label>À payer avant</label><input type="date" name="Echeance" value="' + esc(frToIso(v.Echeance || '')) + '"></div></div>' +
+      '<div class="field"><label>Facture (photos ou PDF, plusieurs possibles)</label><input type="file" id="aFile" accept="image/*,application/pdf" multiple>' +
+      '<p class="muted small" style="margin:4px 0 0">Rangée dans le Drive, sous-dossier <b>Factures fournisseurs</b> ou <b>Factures intervenants</b> selon le type.</p>' +
+      ((v.pieces || []).length ? '<p class="muted small" style="margin:4px 0 0">Déjà rangé : ' + v.pieces.map(function (u, i) { return '<a href="' + esc(safeUrl(u)) + '" target="_blank" rel="noopener">pièce ' + (i + 1) + '</a>'; }).join(' · ') + '</p>' : '') + '</div>' +
+      '<div class="field"><label>Notes</label><input name="Notes" value="' + esc(v.Notes || '') + '"></div>' +
+      '<input type="hidden" name="ID" value="' + esc(v.ID || '') + '"><input type="hidden" name="Lien" value="' + esc(v.Lien || '') + '">' +
+      '<input type="hidden" name="Pieces" value="' + esc(v.Pieces || '') + '">' +
+      '<p class="muted small">Rien n\'est écrit dans la caisse maintenant : la dépense y est notée quand tu cliques sur <b>Payer</b>.</p>' +
+      '<button class="btn primary big" type="submit" style="width:100%">Enregistrer</button></form>');
+    var f = $('#fAchat');
+    function majAutre() { $('#aAutreBox').hidden = f.Beneficiaire.value !== '__autre'; }
+    f.Beneficiaire.addEventListener('change', majAutre); majAutre();
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = f.querySelector('button[type=submit]'); busy(b, true);
+      var o = {}; $all('[name]', f).forEach(function (i) { o[i.name] = i.value; });
+      if (o.Beneficiaire === '__autre') o.Beneficiaire = (o.Autre || '').trim();
+      o.Montant = String(o.Montant).replace(',', '.');
+      var files = Array.prototype.slice.call($('#aFile').files).slice(0, 10);
+      var dossier = o.Type === 'Fournisseur' || o.Type === 'Autre' ? 'fournisseurs' : 'intervenants';
+      var up = files.length
+        ? Promise.all(files.map(function (f) { return readFile(f).then(function (b64) { return { name: f.name, mime: f.type, data: b64 }; }); }))
+          .then(function (fs) { return call('uploadJustificatif', { fichiers: fs, dossier: dossier }); })
+        : Promise.resolve(null);
+      up.then(function (u) {
+        if (u) {
+          var urls = u.fichiers.map(function (x) { return x.url; });
+          // le lien principal reste le premier document, les suivants rejoignent les pièces
+          if (!o.Lien) o.Lien = urls.shift();
+          o.Pieces = (o.Pieces ? o.Pieces.split('|').map(function (x) { return x.trim(); }) : []).concat(urls).filter(String).join(' | ');
+        }
+        return call('saveAchat', o);
+      })
+        .then(function () { toast('Enregistré'); closeDrawer(); go(S.view, S.param); })
+        .catch(function (e) { busy(b, false); fail(e); });
+    });
+  }
+  ACT.newAchat = function () { formAchat({}); };
+  ACT.achatEdit = function (t) { formAchat((S.data.achats.liste || [])[+t.dataset.i]); };
+  ACT.achatPayer = function (t) {
+    var r = (S.data.achats.liste || [])[+t.dataset.i];
+    if (!r) return;
+    openDrawer('Payer ' + r.Beneficiaire, '<form id="fPay"><p class="muted small" style="margin-top:0">' + esc(r.Objet || '') + '</p>' +
+      '<p style="font-family:var(--head);font-size:28px;margin:0 0 14px">' + eur(r.montant) + '</p>' +
+      '<div class="row"><div class="field"><label>Payé par</label><select name="mode"><option>Virement</option><option>Chèque</option><option>Cash</option></select></div>' +
+      '<div class="field"><label>Date du paiement</label><input type="date" name="date" value="' + todayIso() + '"></div></div>' +
+      '<label class="small" style="display:flex;gap:8px;align-items:center;margin-bottom:12px"><input type="checkbox" name="caisse" checked> Noter aussi la dépense dans la caisse (Compte aussi)</label>' +
+      '<button class="btn primary big" type="submit" style="width:100%">Marquer payée</button></form>');
+    var f = $('#fPay');
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = f.querySelector('button[type=submit]'); busy(b, true);
+      call('payerAchat', { id: r.ID, mode: f.mode.value, date: f.date.value, caisse: f.caisse.checked })
+        .then(function (x) { closeDrawer(); toast('Payée' + (x && x.caisse ? ' + notée dans la caisse' : '')); go(S.view, S.param); })
+        .catch(function (e) { busy(b, false); fail(e); });
+    });
+  };
+  ACT.achatSuppr = function (t) {
+    if (!confirm('Retirer cette facture à payer ?')) return;
+    busy(t, true);
+    call('supprimerAchat', { id: t.dataset.id }).then(function () { toast('Retirée'); go(S.view, S.param); }).catch(function (e) { busy(t, false); fail(e); });
+  };
+
+  // ---------- Ma facturation : les intervenants facturent l'ecole ----------
+  VIEWS.facturation = function (el) {
+    return swrN(['intervenants', 'facturesInterv'], function (r) {
+      var d = r[0] || { liste: [] }, fact = r[1] || [];
+      S.data.interv = d;
+      S.data.factInterv = fact;
+      var h = '<div class="page-head"><div><h1>Ma facturation</h1><p>Chacun facture ses heures à ' + esc(d.structure ? d.structure.structure : 'l\'association') + '. La fiche se remplit une fois, ensuite tout est repris.</p></div>' +
+        '<div class="actions"><button class="btn" data-act="convention">' + ICON.docs + 'Convention annuelle</button>' +
+        '<button class="btn primary" data-act="newFactInterv">' + ICON.plus + 'Nouvelle facture</button></div></div>';
+      h += '<div class="grid g3">' + d.liste.map(function (iv) {
+        return '<div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start"><b style="font-family:var(--head);font-size:17px">' + esc(iv.Nom) + '</b>' +
+          '<span class="b ' + (iv.complet ? 'green' : 'yellow') + '">' + (iv.complet ? 'fiche OK' : 'fiche à compléter') + '</span></div>' +
+          '<div class="muted small">' + esc([iv.Statut, iv.SIRET ? 'SIRET ' + iv.SIRET : '', iv.Email].filter(Boolean).join(' · ') || 'rien de rempli pour l\'instant') + '</div>' +
+          '<div class="muted small">Prochaine facture : <b>' + esc(iv.prochain) + '</b></div>' +
+          '<div class="actions" style="margin-top:10px"><button class="btn sm" data-act="ficheInterv" data-id="' + esc(iv.ID) + '">Ma fiche</button>' +
+          '<button class="btn sm primary" data-act="newFactInterv" data-id="' + esc(iv.ID) + '">Facturer</button>' +
+          '<button class="btn sm ghost" data-act="renumInterv" data-id="' + esc(iv.ID) + '" data-nom="' + esc(iv.Nom) + '" title="Repartir de la bonne numérotation">N°</button></div></div>';
+      }).join('') + '<div class="card"><b style="font-family:var(--head);font-size:17px">Ajouter quelqu\'un</b><div class="muted small">Un nouvel intervenant qui doit facturer ses heures.</div>' +
+        '<div class="actions" style="margin-top:10px"><button class="btn sm" data-act="ficheInterv">' + ICON.plus + 'Nouvelle fiche</button></div></div></div>';
+
+      h += '<div class="section"><h2>Factures émises</h2><div class="card">' + (fact.length ?
+        '<div class="tscroll"><table class="t resp"><thead><tr><th>N°</th><th>Qui</th><th>Période</th><th class="num">Montant</th><th>Statut</th><th></th></tr></thead><tbody>' +
+        fact.map(function (f, i) {
+          return '<tr><td data-l="N°"><b>' + esc(f.Numero) + '</b><div class="muted small">' + esc(f.Date) + '</div></td>' +
+            '<td data-l="Qui">' + esc(f.Intervenant) + '</td><td data-l="Période">' + esc(f.Periode) + '</td>' +
+            '<td data-l="Montant" class="num">' + eur(f.Total) + '</td>' +
+            '<td data-l="Statut"><span class="b ' + (f.Statut === 'Envoyee' ? 'green' : 'yellow') + '">' + esc(f.Statut) + '</span></td>' +
+            '<td><div class="actions" style="justify-content:flex-end;flex-wrap:nowrap">' +
+            (f.LienPdf ? '<a class="btn sm" href="' + esc(safeUrl(f.LienPdf)) + '" target="_blank" rel="noopener">PDF</a>' : '') +
+            '<button class="btn sm" data-act="envoyerFactInterv" data-i="' + i + '">Par mail</button>' +
+            '<button class="btn sm ghost danger" data-act="supprFactInterv" data-id="' + esc(f.ID) + '">✕</button></div></td></tr>';
+        }).join('') + '</tbody></table></div>' : '<div class="empty">Aucune facture pour l\'instant.</div>') +
+        '<p class="muted small">Les PDF sont rangés dans le dossier Drive <b>Devis / Facture &gt; Factures intervenants</b>, et chaque facture crée sa ligne dans les factures à payer de la Compta.</p></div></div>';
+      el.innerHTML = h;
+    });
+  };
+
+  ACT.ficheInterv = function (t) {
+    var iv = ((S.data.interv || {}).liste || []).filter(function (x) { return String(x.ID) === t.dataset.id; })[0] || {};
+    openDrawer(iv.ID ? 'Fiche de ' + iv.Nom : 'Nouvelle fiche intervenant', '<form id="fIv">' +
+      '<p class="muted small" style="margin-top:0">Ces infos servent d\'en-tête à tes factures. À remplir une fois, elles sont ensuite reprises automatiquement.</p>' +
+      '<div class="row"><div class="field"><label>Nom et prénom</label><input name="Nom" required value="' + esc(iv.Nom || '') + '"></div>' +
+      '<div class="field"><label>Statut</label><input name="Statut" value="' + esc(iv.Statut || 'Auto-entrepreneur') + '"></div></div>' +
+      '<div class="field"><label>Adresse</label><input name="Adresse" value="' + esc(iv.Adresse || '') + '"></div>' +
+      '<div class="row"><div class="field"><label>Code postal</label><input name="CP" value="' + esc(iv.CP || '') + '"></div>' +
+      '<div class="field"><label>Ville</label><input name="Ville" value="' + esc(iv.Ville || '') + '"></div>' +
+      '<div class="field"><label>SIRET</label><input name="SIRET" value="' + esc(iv.SIRET || '') + '" placeholder="14 chiffres"></div></div>' +
+      '<div class="row"><div class="field"><label>Email</label><input name="Email" type="email" value="' + esc(iv.Email || '') + '"></div>' +
+      '<div class="field"><label>Téléphone</label><input name="Tel" inputmode="tel" value="' + esc(iv.Tel || '') + '"></div></div>' +
+      '<div class="row"><div class="field"><label>IBAN</label><input name="IBAN" value="' + esc(iv.IBAN || '') + '"></div>' +
+      '<div class="field"><label>BIC</label><input name="BIC" value="' + esc(iv.BIC || '') + '"></div></div>' +
+      '<div class="row"><div class="field"><label>Mention TVA</label><input name="MentionTVA" value="' + esc(iv.MentionTVA || 'TVA non applicable, article 293 B du CGI') + '"></div>' +
+      '<div class="field"><label>N° de la prochaine facture</label><input name="ProchainNum" inputmode="numeric" value="' + esc(iv.ProchainNum || 1) + '"></div></div>' +
+      '<input type="hidden" name="ID" value="' + esc(iv.ID || '') + '">' +
+      '<button class="btn primary big" type="submit" style="width:100%">Enregistrer ma fiche</button></form>');
+    var f = $('#fIv');
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = f.querySelector('button[type=submit]'); busy(b, true);
+      var o = {}; $all('[name]', f).forEach(function (i) { o[i.name] = i.value; });
+      call('saveIntervenant', o).then(function () { toast('Fiche enregistrée'); closeDrawer(); go('facturation'); })
+        .catch(function (e) { busy(b, false); fail(e); });
+    });
+  };
+
+  // Numerotation : elle se recalcule sur les factures qui existent vraiment, et on peut
+  // forcer un depart si des numeros ont deja ete utilises hors de l'ERP.
+  ACT.renumInterv = function (t) {
+    openDrawer('Numérotation de ' + t.dataset.nom, '<form id="fNum">' +
+      '<p class="muted small" style="margin-top:0">Le numéro suivant est calculé sur les factures réellement présentes dans la liste. ' +
+      'Après des essais supprimés, ce bouton remet le compteur d\'aplomb.</p>' +
+      '<div class="field"><label>Repartir à (laisser vide pour recalculer tout seul)</label>' +
+      '<input name="depart" inputmode="numeric" placeholder="ex : 1"></div>' +
+      '<button class="btn primary big" type="submit" style="width:100%">Mettre à jour la numérotation</button></form>');
+    var f = $('#fNum');
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = f.querySelector('button[type=submit]'); busy(b, true);
+      call('reinitNumInterv', { id: t.dataset.id, depart: f.depart.value })
+        .then(function (r) { toast('Prochaine facture : ' + r.prochain); closeDrawer(); go('facturation'); })
+        .catch(function (e) { busy(b, false); fail(e); });
+    });
+  };
+  ACT.convention = function (t) {
+    if (!confirm('Générer la convention annuelle de prestation de services ?\n\nUn seul document pour toute l\'équipe, avec les annexes chiffrées reprises du modèle économique. Il sert de justificatif aux paiements mensuels.')) return;
+    busy(t, true);
+    call('conventionCollective', { date: todayIso() }).then(function (r) {
+      busy(t, false);
+      openDrawer('Convention annuelle', '<div class="box"><h4>' + esc(r.fichier) + '</h4>' +
+        '<p class="small">Établie le ' + esc(r.date) + ' pour ' + r.intervenants.map(esc).join(', ') + '. ' +
+        'Rangée dans le Drive, dossier <b>Factures intervenants</b>. Les factures lissées y renvoient automatiquement.</p>' +
+        '<div class="actions"><a class="btn primary" href="' + esc(safeUrl(r.pdf)) + '" target="_blank" rel="noopener">Ouvrir le PDF</a>' +
+        '<a class="btn" href="' + esc(safeUrl(r.doc)) + '" target="_blank" rel="noopener">Retoucher le Doc</a></div>' +
+        '<p class="muted small" style="margin-bottom:0">À regénérer après chaque changement de rémunération : l\'annexe 2 doit dire la même chose que les factures.</p></div>');
+    }).catch(function (e) { busy(t, false); fail(e); });
+  };
+  ACT.newFactInterv = function (t) {
+    var liste = (S.data.interv || {}).liste || [];
+    if (!liste.length) return toast('Crée d\'abord une fiche intervenant', true);
+    var sel = t && t.dataset.id ? t.dataset.id : liste[0].ID;
+    var mois = [];
+    var now = new Date();
+    var moisIso = function (d) { return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-01'; };
+    for (var i = -13; i <= 2; i++) { var d = new Date(now.getFullYear(), now.getMonth() + i, 1); mois.push({ v: moisIso(d), l: d.toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' }) }); }
+    var moisActuel = moisIso(now);
+    openDrawer('Nouvelle facture', '<form id="fFI">' +
+      '<div class="row"><div class="field"><label>Qui facture</label><select name="intervenantId">' +
+      liste.map(function (x) { return '<option value="' + esc(x.ID) + '"' + (x.ID === sel ? ' selected' : '') + '>' + esc(x.Nom) + '</option>'; }).join('') + '</select></div>' +
+      '<div class="field"><label>Date de la facture</label><input type="date" name="date" value="' + todayIso() + '"></div></div>' +
+      '<div class="field"><label>Période facturée</label><div id="fiMois" class="moislist"></div>' +
+      '<div class="actions" style="margin-top:8px"><button class="btn sm" type="button" data-act="fiMoisPlus">' + ICON.plus + 'Ajouter un mois</button></div></div>' +
+      '<div class="actions"><button class="btn" type="button" data-act="fiProposer">Proposer les lignes</button></div>' +
+      '<div id="fiInfo"></div>' +
+      '<div class="hr"></div><div id="fiLignes"></div><button class="btn sm" type="button" data-act="fiLigne">' + ICON.plus + 'Ligne</button>' +
+      '<p id="fiTotal" style="font-family:var(--head);font-size:22px;margin:14px 0"></p>' +
+      '<div class="field"><label>Note en bas de facture (facultatif)</label><input name="notes" placeholder="Ex : merci de votre confiance"></div>' +
+      '<button class="btn primary big" type="submit" style="width:100%">Générer la facture (PDF)</button></form>');
+    var f = $('#fFI');
+    // la période se choisit en clair : « Je facture le mois de septembre 2026 », et on ajoute
+    // des mois à la suite quand on facture plusieurs mois d'un coup
+    S.fiMois = [moisActuel];
+    S.fiMoisChoix = mois;
+    fiRenduMois();
+    f.addEventListener('input', fiTotal);
+    f.intervenantId.addEventListener('change', function () { ACT.fiProposer({}); });
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var b = f.querySelector('button[type=submit]'); busy(b, true);
+      call('creerFactureInterv', {
+        intervenantId: f.intervenantId.value, date: f.date.value, debut: fiMoisBornes().debut, fin: fiMoisBornes().fin,
+        periode: S.fiPeriode || '', notes: f.notes.value, lignes: fiLignesLues(),
+        detail: S.fiDetail || [], compteur: S.fiCompteur || null
+      }).then(function (r) {
+        drawerBody('<div class="box"><h4>Facture ' + esc(r.numero) + ' créée</h4><p>' + esc(r.fichier) + ' · ' + eur(r.total) + '</p>' +
+          '<div class="actions"><a class="btn primary" href="' + esc(safeUrl(r.pdf)) + '" target="_blank" rel="noopener">Ouvrir / télécharger le PDF</a>' +
+          '<a class="btn" href="' + esc(safeUrl(r.doc)) + '" target="_blank" rel="noopener">Retoucher le Doc</a>' +
+          '<button class="btn dark" data-act="envoyerFactIntervId" data-id="' + esc(r.id) + '">Me l\'envoyer par mail</button></div>' +
+          '<p class="muted small">' + (r.achat ? 'La ligne « à payer » a été créée dans la Compta.' : 'Ligne « à payer » non créée, à ajouter à la main.') + '</p></div>');
+        go('facturation');
+      }).catch(function (e) { busy(b, false); fail(e); });
+    });
+    ACT.fiProposer({ closest: function () { return null; } });
+  };
+  // ---- période de facturation : une ligne par mois, en français ----
+  function fiRenduMois() {
+    var box = $('#fiMois'); if (!box) return;
+    var choix = S.fiMoisChoix || [];
+    box.innerHTML = (S.fiMois || []).map(function (v, i) {
+      return '<div class="moisrow"><span class="muted small">Je facture le mois de</span>' +
+        '<select class="fiM" data-i="' + i + '">' + choix.map(function (m) {
+          return '<option value="' + m.v + '"' + (m.v === v ? ' selected' : '') + '>' + esc(m.l) + '</option>';
+        }).join('') + '</select>' +
+        (S.fiMois.length > 1 ? '<button class="btn sm ghost danger" type="button" data-act="fiMoisMoins" data-i="' + i + '">✕</button>' : '') +
+        '</div>';
+    }).join('');
+    $all('.fiM', box).forEach(function (sel) {
+      sel.addEventListener('change', function () {
+        S.fiMois[+sel.dataset.i] = sel.value;
+        fiTrierMois(); fiRenduMois(); ACT.fiProposer({});
+      });
+    });
+  }
+  function fiTrierMois() { S.fiMois = (S.fiMois || []).filter(function (v, i, a) { return a.indexOf(v) === i; }).sort(); }
+  /** Les bornes envoyées au serveur : du premier au dernier mois coché */
+  function fiMoisBornes() {
+    var m = (S.fiMois || []).slice().sort();
+    return { debut: m[0] || '', fin: m[m.length - 1] || m[0] || '' };
+  }
+  ACT.fiMoisPlus = function () {
+    var choix = S.fiMoisChoix || [];
+    var dernier = (S.fiMois || []).slice().sort().pop();
+    var k = choix.map(function (m) { return m.v; }).indexOf(dernier);
+    var suivant = choix[Math.min(k + 1, choix.length - 1)];
+    if (!suivant || S.fiMois.indexOf(suivant.v) >= 0) {
+      // le mois suivant est déjà pris : on prend le premier libre
+      suivant = choix.filter(function (m) { return S.fiMois.indexOf(m.v) < 0; })[0];
+    }
+    if (!suivant) { toast('Tous les mois de la liste sont déjà pris', true); return; }
+    S.fiMois.push(suivant.v);
+    fiTrierMois(); fiRenduMois(); ACT.fiProposer({});
+  };
+  ACT.fiMoisMoins = function (t) {
+    S.fiMois.splice(+t.dataset.i, 1);
+    if (!S.fiMois.length) S.fiMois = [(S.fiMoisChoix[0] || {}).v];
+    fiRenduMois(); ACT.fiProposer({});
+  };
+  ACT.fiProposer = function (t) {
+    var f = $('#fFI'); if (!f) return;
+    if (t && t.tagName) busy(t, true);
+    $('#fiLignes').innerHTML = '<div class="loader"><span></span></div>';
+    var nom = (((S.data.interv || {}).liste || []).filter(function (x) { return x.ID === f.intervenantId.value; })[0] || {}).Nom;
+    var b = fiMoisBornes();
+    call('propositionFacture', { nom: nom, debut: b.debut, fin: b.fin }).then(function (r) {
+      S.fiPeriode = r.periode;
+      S.fiDetail = r.detail || [];
+      S.fiCompteur = r.compteur || null;
+      S.fiFiche = r.fiche || null;
+      $('#fiLignes').innerHTML = '';
+      (r.lignes.length ? r.lignes : [{ designation: '', detail: '', qte: 1, pu: 0 }]).forEach(fiAddLigne);
+      if (!r.lignes.length) toast('Rien trouvé sur cette période, à saisir à la main', true);
+      var info = $('#fiInfo');
+      if (info) {
+        // ce qui empêche la proposition automatique s'affiche ici, pas dans un toast rouge qui disparaît
+        var alerte = r.avertissement ? '<div class="box alert"><h4>Proposition automatique incomplète</h4>' +
+          '<p class="small" style="margin:0">' + esc(r.avertissement) + '</p></div>' : '';
+        if (S.fiCompteur) {
+          var fi = S.fiFiche;
+          info.innerHTML = alerte + (fi ? '<div class="box"><h4>D\'après la fiche « ' + esc(fi.nom) + ' » du modèle éco</h4>' +
+            '<div class="tscroll"><table class="t"><thead><tr><th>Nature</th><th>Volume</th><th class="num">Par mois</th></tr></thead><tbody>' +
+            fi.natures.map(function (n) {
+              return '<tr' + (n.paye && n.mensuel ? '' : ' class="muted"') + '><td>' + esc(n.libelle) + (n.paye ? '' : ' <span class="b">non payé</span>') + '</td>' +
+                '<td>' + esc(n.volume || '-') + '</td><td class="num">' + (n.paye && n.mensuel ? eur(n.mensuel) : '-') + '</td></tr>';
+            }).join('') +
+            '<tr style="font-weight:700"><td>Mensualité ' + esc(fi.rang) + '</td><td>' + esc(eur(fi.annuel)) + ' / an</td><td class="num">' + eur(fi.mensuel) + '</td></tr>' +
+            '</tbody></table></div>' +
+            '<p class="small" style="margin:8px 0 0">Seules les natures activées dans Compta &gt; Rémunération sont facturées. Pour changer les heures ou activer une nature, passe par là.</p></div>' : '') +
+            '<div class="box"><h4>Suivi interne, ne figure pas sur la facture</h4>' +
+            '<p class="small" style="margin:0">La facture ne porte que les prestations et leur montant. Le lissage reste entre l\'association et l\'intervenant, il est décrit dans la convention annuelle.</p>' +
+            '<dl class="kv"><dt>Réalisé depuis septembre</dt><dd>' + eur(S.fiCompteur.realise) + '</dd>' +
+            '<dt>Facturé, celle-ci comprise</dt><dd>' + eur(S.fiCompteur.facture) + '</dd>' +
+            '<dt>Écart à régulariser en fin de saison</dt><dd' + (S.fiCompteur.ecart ? ' class="neg"' : '') + '>' + eur(S.fiCompteur.ecart) + '</dd></dl>' +
+            (S.fiDetail.length ? '<p class="small" style="margin:6px 0 0">Détail joint : ' + S.fiDetail.map(function (x) { return esc(x.designation); }).join(', ') + '</p>' : '') + '</div>';
+        } else info.innerHTML = alerte;
+      }
+      fiTotal();
+      if (t && t.tagName) busy(t, false);
+    }).catch(function (e) { $('#fiLignes').innerHTML = ''; fiAddLigne({}); if (t && t.tagName) busy(t, false); fail(e); });
+  };
+  function fiAddLigne(l) {
+    l = l || {};
+    var d = document.createElement('div');
+    d.className = 'fil box';
+    d.innerHTML = '<div class="field"><label>Prestation</label><input data-k="designation" value="' + esc(l.designation || '') + '"></div>' +
+      '<div class="field"><label>Détail</label><input data-k="detail" value="' + esc(l.detail || '') + '"></div>' +
+      '<div class="row"><div class="field"><label>Quantité</label><input data-k="qte" inputmode="decimal" value="' + esc(l.qte === undefined ? 1 : l.qte) + '"></div>' +
+      '<div class="field"><label>Prix unitaire (€)</label><input data-k="pu" inputmode="decimal" value="' + esc(l.pu === undefined ? '' : l.pu) + '"></div></div>';
+    $('#fiLignes').appendChild(d);
+  }
+  function fiLignesLues() {
+    return $all('.fil').map(function (x) {
+      return { designation: $('[data-k=designation]', x).value, detail: $('[data-k=detail]', x).value,
+        qte: $('[data-k=qte]', x).value.replace(',', '.'), pu: $('[data-k=pu]', x).value.replace(',', '.') };
+    });
+  }
+  function fiTotal() {
+    var tot = fiLignesLues().reduce(function (a, l) { return a + (Number(l.qte) || 0) * (Number(l.pu) || 0); }, 0);
+    var el = $('#fiTotal'); if (el) el.textContent = 'Total de la facture : ' + eur(tot) + (S.fiPeriode ? '  ·  ' + S.fiPeriode : '');
+  }
+  ACT.fiLigne = function () { fiAddLigne({}); fiTotal(); };
+  ACT.envoyerFactInterv = function (t) {
+    var f = (S.data.factInterv || [])[+t.dataset.i];
+    if (f) envoyerFI(t, f.ID);
+  };
+  ACT.envoyerFactIntervId = function (t) { envoyerFI(t, t.dataset.id); };
+  function envoyerFI(t, id) {
+    var copie = confirm('Envoyer le PDF par mail.\n\nOK = envoyer aussi une copie à l\'école.\nAnnuler = seulement à l\'intervenant.');
+    busy(t, true);
+    call('envoyerFactureInterv', { id: id, copieEcole: copie }).then(function () { toast('Facture envoyée'); go('facturation'); })
+      .catch(function (e) { busy(t, false); fail(e); });
+  }
+  ACT.supprFactInterv = function (t) {
+    if (!confirm('Supprimer cette facture du suivi ? Le PDF reste dans le Drive.')) return;
+    busy(t, true);
+    call('supprimerFactureInterv', { id: t.dataset.id }).then(function () { toast('Supprimée'); go('facturation'); })
+      .catch(function (e) { busy(t, false); fail(e); });
+  };
+
+  // ---------- Agenda & rappels ----------
+  VIEWS.agenda = function (el) {
+    return swrN(['rappels', 'agenda'], function (r) {
+      var rap = r[0], ag = r[1];
+      var filtre = S.param && S.param.faits ? 'faits' : 'afaire';
+      var liste = rap.filter(function (x) { return filtre === 'faits' ? String(x.Fait).toLowerCase() === 'oui' : String(x.Fait).toLowerCase() !== 'oui'; });
+      var h = '<div class="page-head"><div><h1>Agenda & rappels</h1><p>Rappels de comm, admin, cours... et agenda Google de la structure</p></div><div class="actions"><button class="btn" data-act="newEvent">' + ICON.plus + 'Événement agenda</button><button class="btn primary" data-act="newRappel">' + ICON.plus + 'Rappel</button></div></div>';
+      h += '<div class="grid g2" style="align-items:start"><div><div class="chips"><button class="chip' + (filtre === 'afaire' ? ' on' : '') + '" data-go="agenda">À faire</button><button class="chip' + (filtre === 'faits' ? ' on' : '') + '" data-go="agenda" data-param="' + P({ faits: 1 }) + '">Faits</button></div><div class="card">' +
+        (liste.length ? '<div class="list">' + liste.map(function (x) {
+          var fait = String(x.Fait).toLowerCase() === 'oui';
+          return '<div class="li"><span class="b ' + ({ Comm: 'red', Admin: 'blue', Cours: 'yellow' }[x.Type] || '') + '">' + esc(x.Type) + '</span><div class="main"><div class="t">' + esc(x.Titre) + '</div><div class="s">' + esc((x.Date || 'sans date') + (x.Heure ? ' ' + x.Heure : '') + (x.Detail ? ' · ' + x.Detail : '')) + '</div></div>' +
+            (fait ? '' : '<button class="btn sm" data-act="rappelFait" data-id="' + esc(x.ID) + '">Fait</button>') + '<button class="btn sm ghost" data-act="rappelEdit" data-id="' + esc(x.ID) + '">✎</button><button class="btn sm ghost danger" data-act="rappelDel" data-id="' + esc(x.ID) + '">✕</button></div>';
+        }).join('') + '</div>' : '<div class="empty">Rien ici.</div>') + '</div></div>';
+      var byDay = {};
+      ag.forEach(function (ev) { (byDay[ev.iso] = byDay[ev.iso] || []).push(ev); });
+      h += '<div><div class="card"><h3>' + ICON.agenda + '21 prochains jours</h3>' + (ag.length ? Object.keys(byDay).sort().map(function (k) {
+        var evs = byDay[k];
+        return '<div class="day" style="margin-top:12px">' + esc(evs[0].quand.split(' ').slice(0, 2).join(' ')) + '</div><div class="list">' + evs.map(function (ev) {
+          return '<div class="li">' + heureBulle(ev) + '<div class="main"><div class="t">' + esc(ev.titre) + '</div>' + (ev.lieu ? '<div class="s">' + esc(ev.lieu) + (ev.categorie ? ' · ' + esc(ev.categorie) : '') + '</div>' : (ev.categorie ? '<div class="s">' + esc(ev.categorie) + '</div>' : '')) + '</div></div>';
+        }).join('') + '</div>';
+      }).join('') : '<div class="muted">Rien à l\'agenda.</div>') + '</div></div></div>';
+      S.data.rappels = rap;
+      el.innerHTML = h;
+    });
+  };
+  function rappelForm(r) {
+    r = r || {};
+    return '<form id="fRap"><div class="field"><label>Titre</label><input name="Titre" required value="' + esc(r.Titre || '') + '" placeholder="Ex : Poster le reel stage Toussaint"></div>' +
+      '<div class="row"><div class="field"><label>Type</label><select name="Type">' + ['Comm', 'Admin', 'Cours', 'Autre'].map(function (o) { return '<option' + (r.Type === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select></div>' +
+      '<div class="field"><label>Date</label><input type="date" name="Date" value="' + esc(r.ID ? frToIso(r.Date) : todayIso()) + '"></div><div class="field"><label>Heure</label><input type="time" name="Heure" value="' + esc(r.Heure || '') + '"></div></div>' +
+      '<div class="field"><label>Détail</label><textarea name="Detail">' + esc(r.Detail || '') + '</textarea></div><input type="hidden" name="ID" value="' + esc(r.ID || '') + '"><input type="hidden" name="Fait" value="' + esc(r.Fait || 'non') + '">' +
+      '<button class="btn primary" type="submit">Enregistrer</button></form>';
+  }
+  function bindRappel() {
+    $('#fRap').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var f = ev.target, o = {}; $all('[name]', f).forEach(function (i) { o[i.name] = i.value; });
+      var btn = $('button[type=submit]', f); busy(btn, true);
+      call('saveRappel', o).then(function () { toast('Rappel enregistré'); closeDrawer(); go(S.view, S.param); }).catch(function (err) { busy(btn, false); fail(err); });
+    });
+  }
+  ACT.newRappel = function () { openDrawer('Nouveau rappel', rappelForm()); bindRappel(); };
+  ACT.rappelEdit = function (t) { var r = (S.data.rappels || []).filter(function (x) { return String(x.ID) === t.dataset.id; })[0]; openDrawer('Modifier le rappel', rappelForm(r)); bindRappel(); };
+  ACT.rappelFait = function (t) {
+    busy(t, true);
+    call('rappels').then(function (all) { return all.filter(function (x) { return String(x.ID) === t.dataset.id; })[0]; }).then(function (rr) {
+      if (!rr) throw new Error('Rappel introuvable'); rr.Fait = 'oui'; rr.Date = frToIso(rr.Date); return call('saveRappel', rr); }).then(function () { toast('Fait'); go(S.view, S.param); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+  ACT.rappelDel = function (t) {
+    if (!confirm('Supprimer ce rappel ?')) return;
+    call('deleteRappel', { ID: t.dataset.id }).then(function () { go('agenda', S.param); }).catch(fail);
+  };
+  ACT.newEvent = function () {
+    openDrawer('Événement dans l\'agenda Google', '<form id="fEv"><div class="field"><label>Titre</label><input name="titre" required></div>' +
+      '<div class="row"><div class="field"><label>Date</label><input type="date" name="date" required value="' + todayIso() + '"></div><div class="field"><label>Heure (vide = journée)</label><input type="time" name="heure"></div><div class="field"><label>Durée (min)</label><input name="duree" inputmode="numeric" value="60"></div></div>' +
+      '<div class="field"><label>Lieu</label><input name="lieu"></div><div class="field"><label>Détail</label><textarea name="detail"></textarea></div><button class="btn primary" type="submit">Ajouter à l\'agenda</button></form>');
+    $('#fEv').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var f = ev.target, o = {}; $all('[name]', f).forEach(function (i) { o[i.name] = i.value; });
+      var btn = $('button[type=submit]', f); busy(btn, true);
+      call('creerEvenement', o).then(function () { toast('Ajouté à l\'agenda'); closeDrawer(); go('agenda'); }).catch(function (err) { busy(btn, false); fail(err); });
+    });
+  };
+
+  // ---------- Mails & relances ----------
+  function motifRelance(e) {
+    var pay = e.paye !== 'Oui', inf = e.manquants && e.manquants.length;
+    return pay && inf ? 'Paiement + infos manquantes' : (pay ? 'Paiement à recevoir' : 'Infos manquantes');
+  }
+  VIEWS.mails = function (el) {
+    return swrN(['aRelancer', 'mails'], function (r) {
+      var relD = r[0] || {}, m = r[1];
+      var rel = relD.liste || relD, stats = relD.stats || null;
+      S.data.aRelancer = rel;
+      var h = '<div class="page-head"><div><h1>Mails & relances</h1><p>Clique sur un mail pour le voir, l\'envoyer, le modifier ou le supprimer.</p></div><div class="actions"><a class="btn" href="https://mail.google.com/mail/#inbox" target="_blank" rel="noopener">' + ICON.ext + 'Ouvrir Gmail</a></div></div>';
+      // 1. non lus + brouillons
+      h += '<div class="grid g2" style="align-items:start"><div><div class="row" style="justify-content:space-between;align-items:center;margin-bottom:12px"><h2 style="font-size:20px;margin:0">Boîte de réception <span class="b red">' + m.nonLus + ' non lu' + (m.nonLus > 1 ? 's' : '') + '</span></h2>' +
+        '<button class="btn sm" data-act="majBoite" title="Recharger seulement la boîte de réception">' + ICON.refresh + 'Actualiser</button></div><div class="card">' + (m.threads.length ? '<div class="list">' + m.threads.map(function (t) {
+        return '<div class="li' + (t.nonLu ? ' nonlu' : '') + '"><input type="checkbox" class="inboxChk" data-id="' + esc(t.id) + '" aria-label="Cocher ' + esc(t.sujet) + '">' +
+          '<div class="main click" data-act="voirMail" data-id="' + esc(t.id) + '"><div class="t">' + (t.nonLu ? '<span class="b red">non lu</span> ' : '') + esc(t.sujet) + '</div><div class="s">' + esc(t.de) + ' · ' + esc(t.extrait) + '</div></div>' +
+          (t.brouillon ? '<button class="btn sm primary" data-act="voirBrouillon" data-id="' + esc(t.brouillon) + '">Réponse prête</button>' : '<span class="muted small">' + esc(t.date) + '</span>') + '</div>';
+      }).join('') + '</div><div class="actions" style="margin-top:10px"><button class="btn sm" data-act="inboxTous">Tout cocher</button><button class="btn sm" data-act="inboxAction" data-a="lu">Marquer comme lu</button><button class="btn sm danger" data-act="inboxAction" data-a="corbeille">Supprimer</button></div>' : '<div class="muted">Boîte vide.</div>') + '</div></div>';
+      h += '<div><h2 style="font-size:20px;margin-bottom:12px">Brouillons en attente <span class="b yellow">' + m.drafts.length + '</span></h2><div class="card">' + (m.drafts.length ? '<div class="list">' + m.drafts.map(function (d) {
+        return '<div class="li click" data-act="voirBrouillon" data-id="' + esc(d.id) + '"><div class="main"><div class="t">' + etiqBadge(d.etiquette) + esc(d.sujet) + '</div><div class="s">à ' + esc(d.a || '(pas de destinataire)') + ' · ' + esc(d.extrait) + '</div></div><span class="muted small">' + esc(d.date) + '</span></div>';
+      }).join('') + '</div>' : '<div class="muted">Aucun brouillon.</div>') + '</div></div></div>';
+      // 2. à relancer, rangé par motif (menus dépliables)
+      h += '<div class="section"><h2>À relancer <span class="b yellow">' + rel.length + '</span></h2>';
+      if (stats) {
+        var horsJeu = [
+          [stats.payes, 'déjà payé', 'déjà payés'],
+          [stats.recents, 'inscrit il y a moins de ' + stats.jours + ' jours', 'inscrits il y a moins de ' + stats.jours + ' jours'],
+          [stats.sansEmail, 'sans adresse mail', 'sans adresse mail'],
+          [stats.desinscrits, 'désinscrit', 'désinscrits'],
+          [stats.relanceRecente, 'relancé il y a moins de ' + stats.joursInter + ' jours', 'relancés il y a moins de ' + stats.joursInter + ' jours'],
+          [stats.offerts, 'en tarif offert', 'en tarif offert']
+        ].filter(function (x) { return x[0]; }).map(function (x) { return x[0] + ' ' + (x[0] > 1 ? x[2] : x[1]); });
+        h += '<div class="box"><p class="small" style="margin:0"><b>' + stats.aRelancer + ' sur ' + stats.total + ' inscrits.</b>' +
+          (horsJeu.length ? ' Pas relancés : ' + esc(horsJeu.join(', ')) + '.' : '') +
+          ' Les délais se règlent dans l\'onglet Config : RELANCE_APRES_JOURS (' + stats.jours + ') et RELANCE_INTERVALLE_JOURS (' + stats.joursInter + ').</p></div>';
+      }
+      if (rel.length) {
+        // un foyer = une adresse mail = UN message, même avec trois enfants inscrits
+        var parId = {};
+        rel.forEach(function (e, i) { parId[e.source + '|' + e.id] = i; });
+        var foyers = (r[0].foyers || []).slice();
+        // le mail de chaque foyer arrive déjà écrit : l'aperçu ne demande plus rien au serveur
+        foyers.forEach(function (f, i) {
+          f._i = i;
+          f._idx = f.eleves.map(function (e) { return parId[e.source + '|' + e.id]; }).filter(function (x) { return x !== undefined; });
+          f._noms = f.eleves.map(function (e) { return e.prenom + ' ' + e.nom; }).join(', ');
+          f._groupe = f.montant === null ? 'verif'
+            : (f.eleves.some(function (e) { return (e.manquants || []).length; }) ? 'infos' : 'simple');
+        });
+        S.data.foyers = foyers;
+        S.data.relLogo = r[0].logo || '';
+        h += '<p class="muted small" style="margin-top:0">Pense d\'abord à noter les paiements déjà reçus dans les fiches. ' +
+          '<b>' + foyers.length + ' message(s) pour ' + rel.length + ' inscription(s)</b> : les frères et sœurs sont regroupés en un seul mail. ' +
+          'Clique sur une famille pour lire son mail, puis passe au suivant avec les flèches.</p>';
+        h += '<div class="actions" style="margin:0 0 12px"><button class="btn primary" data-act="voirFoyer" data-f="0">' + ICON.mail + 'Lire les ' + foyers.length + ' mails un par un</button>' +
+          '<button class="btn sm" data-act="relAll">Tout cocher</button><button class="btn sm" data-act="relNone">Tout décocher</button></div>';
+        // rangés par motif, en menus dépliables : on ouvre d'abord ce qui demande une vérification
+        [['verif', 'Tarif particulier, montant à confirmer', 'Fratrie, tarif commune, demi-année, à la carte : le montant exact n\'est pas calculable automatiquement. Leur mail ne donne aucun chiffre et annonce une confirmation de ta part. À relire avant d\'envoyer.', 1],
+          ['infos', 'Paiement à recevoir, et des infos manquent au dossier', 'Leur mail ne parle que du règlement : le complément d\'infos se demande dans un message à part.', 1],
+          ['simple', 'Paiement à recevoir', 'Montant calculé depuis la grille tarifaire, rien à vérifier.', 1]
+        ].forEach(function (g) {
+          var l = foyers.filter(function (f) { return f._groupe === g[0]; });
+          if (!l.length) return;
+          h += '<details class="relgroup"' + (g[3] ? ' open' : '') + '><summary><b>' + g[1] + '</b> <span class="b ' + (g[0] === 'verif' ? 'red' : 'yellow') + '">' + l.length + '</span></summary>' +
+            '<p class="muted small" style="margin:6px 0 10px">' + g[2] + '</p><div class="card"><div class="list">' +
+            l.map(function (f) {
+              var vus = {};
+              var detail = f.eleves.map(function (e) {
+                var d = [e.reduction ? 'réduction : ' + e.reduction : '', e.commentaire ? 'a écrit : ' + e.commentaire : '',
+                  e.montantRecu ? e.montantRecu + ' € déjà reçus' : '', e.paye === 'Partiel' ? 'paiement partiel' : '',
+                  (e.manquants || []).length ? 'manque : ' + e.manquants.join(', ') : ''].filter(Boolean).join(' · ');
+                if (!d || vus[e.prenom + d]) return '';       // deux enfants, même remarque : on ne l'écrit qu'une fois
+                vus[e.prenom + d] = 1;
+                return f.eleves.length > 1 ? e.prenom + ' : ' + d : d;
+              }).filter(Boolean).join(' | ');
+              return '<div class="li"><input type="checkbox" class="relFoyer" data-idx="' + esc(f._idx.join(',')) + '" checked aria-label="Cocher ' + esc(f._noms) + '">' +
+                '<div class="main click" data-act="voirFoyer" data-f="' + f._i + '"><div class="t">' + esc(f._noms) +
+                (f.eleves.length > 1 ? ' <span class="b">' + f.eleves.length + ' enfants, un seul mail</span>' : '') + '</div>' +
+                '<div class="s">' + esc(f.email) + (f.montant !== null ? ' · <b>' + eur(f.montant) + '</b>' : ' · <b class="b red">montant à confirmer</b>') + '</div>' +
+                (detail ? '<div class="s">' + esc(detail) + '</div>' : '') + '</div>' +
+                '<button class="btn sm" data-act="voirFoyer" data-f="' + f._i + '">Voir le mail</button></div>';
+            }).join('') + '</div></div></details>';
+        });
+        h += '<div class="actions" style="margin-top:12px"><button class="btn sm" data-act="relAll">Tout cocher</button>' +
+          '<button class="btn sm" data-act="relNone">Tout décocher</button>' +
+          '<button class="btn primary" data-act="relGo">Préparer les brouillons</button>' +
+          '<button class="btn" data-act="relNoter" title="Pour les relances faites ailleurs : mail écrit à la main, téléphone">Marquer comme relancés</button></div>' +
+          '<p class="muted small">« Marquer comme relancés » note la date du jour sans rien envoyer. À utiliser quand la relance est partie en dehors de l\'ERP, sinon ces familles ressortent ici indéfiniment.</p>';
+      } else h += '<div class="card"><div class="muted">Personne à relancer.</div></div>';
+      h += '</div>';
+      el.innerHTML = h;
+    });
+  };
+  ACT.majBoite = function (t) {
+    busy(t, true);
+    rafraichir(['mails']).then(function () { busy(t, false); toast('Boîte de réception à jour'); if (S.view === 'mails') go('mails'); });
+  };
+  ACT.voirMail = function (t) {
+    var id = t.dataset.id;
+    openDrawer('Mail reçu', '<div class="loader"><span></span></div>');
+    call('mailVoir', { id: id }).then(function (d) {
+      S.mailRecu = d;
+      var corps = d.html || ('<pre style="white-space:pre-wrap;font:14px Arial;padding:12px">' + esc(d.corps) + '</pre>');
+      $('#drawerTitle').textContent = d.sujet;
+      drawerBody('<div class="mailhead"><div><span class="muted">De</span> <b>' + esc(d.de) + '</b></div><div><span class="muted">Reçu</span> ' + esc(d.date) + (d.messages > 1 ? ' · ' + d.messages + ' messages' : '') + '</div></div>' +
+        '<iframe class="mailframe" sandbox title="Aperçu du mail"></iframe>' +
+        '<div class="actions mail-actions">' +
+        (d.brouillon ? '<button class="btn primary big" data-act="voirBrouillon" data-id="' + esc(d.brouillon) + '">Voir la réponse prête</button>' : '') +
+        '<a class="btn" href="' + esc(safeUrl(d.lien)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Répondre dans Gmail</a>' +
+        (d.nonLu ? '<button class="btn" data-act="mailRecuAction" data-a="lu" data-id="' + esc(d.id) + '">Marquer comme lu</button>' : '') +
+        '<button class="btn danger" data-act="mailRecuAction" data-a="corbeille" data-id="' + esc(d.id) + '">Supprimer</button></div>');
+      $('#drawerBody .mailframe').srcdoc = '<!doctype html><meta charset="utf-8"><base target="_blank"><style>body{margin:0;font:14px Arial}</style>' + corps;
+    }).catch(fail);
+  };
+  ACT.mailRecuAction = function (t) {
+    var corb = t.dataset.a === 'corbeille';
+    if (corb && !confirm('Mettre ce mail à la corbeille ?')) return;
+    busy(t, true);
+    call('mailsAction', { ids: [t.dataset.id], action: t.dataset.a }).then(function () {
+      closeDrawer(); toast(corb ? 'Mail à la corbeille' : 'Marqué comme lu'); if (S.view === 'mails') go('mails');
+    }).catch(function (e) { busy(t, false); fail(e); });
+  };
+  ACT.inboxTous = function () { var c = $all('.inboxChk'), tout = c.every(function (x) { return x.checked; }); c.forEach(function (x) { x.checked = !tout; }); };
+  ACT.inboxAction = function (t) {
+    var ids = $all('.inboxChk').filter(function (c) { return c.checked; }).map(function (c) { return c.dataset.id; });
+    if (!ids.length) return toast('Coche au moins un mail', true);
+    var corb = t.dataset.a === 'corbeille';
+    if (corb && !confirm('Mettre ' + ids.length + ' mail(s) à la corbeille ? (récupérables 30 jours dans Gmail)')) return;
+    busy(t, true);
+    call('mailsAction', { ids: ids, action: t.dataset.a }).then(function (r) {
+      // mise à jour locale immédiate, le serveur confirme en arrière-plan
+      var m = PAGES.mails && PAGES.mails.data;
+      if (m) { m.threads = m.threads.filter(function (x) { return ids.indexOf(x.id) < 0; }); m.nonLus = Math.max(0, m.nonLus - r.n); }
+      toast(r.n + ' mail(s) ' + (corb ? 'à la corbeille' : 'marqué(s) comme lu(s)'));
+      go('mails');
+    }).catch(function (e) { busy(t, false); fail(e); });
+  };
+  ACT.voirRelance = function (t) {
+    var e = S.data.aRelancer[+t.dataset.i];
+    apercuEleve(e.source, e.id, 'relance', null);
+  };
+  /**
+   * Aperçu du mail de relance d'un foyer : c'est le mail complet, tel qu'il partira,
+   * frères et sœurs compris. Le texte est déjà là, rien n'est demandé au serveur,
+   * donc on feuillette les familles instantanément.
+   */
+  function apercuFoyer(fi) {
+    var l = S.data.foyers || [];
+    if (!l.length) return;
+    fi = Math.max(0, Math.min(l.length - 1, +fi || 0));
+    var f = l[fi];
+    var e0 = f.eleves[0];
+    mailViewer({
+      titre: 'Relance · ' + f._noms,
+      to: f.email, sujet: f.sujet, corps: f.corps,
+      html: String(f.html || '').split('{{LOGO}}').join(S.data.relLogo || ''),
+      eleve: { source: e0.source, id: e0.id, type: 'relance' },
+      items: f.eleves.map(function (e) { return { source: e.source, id: e.id }; }),
+      corpsPret: true,                  // le corps affiché est celui du foyer, pas celui d'un seul enfant
+      nav: { i: fi, n: l.length }
+    });
+  }
+  ACT.voirFoyer = function (t) { apercuFoyer(t.dataset.f); };
+  ACT.foyerNav = function (t) { apercuFoyer(t.dataset.f); };
+  ACT.voirBrouillon = function (t) {
+    openDrawer('Brouillon', '<div class="loader"><span></span></div>');
+    call('brouillonVoir', { id: t.dataset.id }).then(function (d) {
+      mailViewer({ titre: 'Brouillon', to: d.a, sujet: d.sujet, etiquette: d.etiquette, corps: d.corps, html: d.html, draftId: d.id, piecesJointes: d.piecesJointes });
+    }).catch(fail);
+  };
+  ACT.relAll = function () { $all('.relFoyer').forEach(function (c) { c.checked = true; }); };
+  ACT.relNone = function () { $all('.relFoyer').forEach(function (c) { c.checked = false; }); };
+  /** Les inscriptions cochées, à plat : un foyer coché = tous ses enfants */
+  function relItems() {
+    var items = [];
+    $all('.relFoyer').filter(function (c) { return c.checked; }).forEach(function (c) {
+      String(c.dataset.idx || '').split(',').filter(String).forEach(function (i) {
+        var e = S.data.aRelancer[+i];
+        if (e) items.push({ source: e.source, id: e.id });
+      });
+    });
+    return items;
+  }
+  /**
+   * Relance déjà partie ailleurs (mail écrit à la main, téléphone) : on note juste la date,
+   * sinon ces familles restent dans la liste et se font relancer deux fois.
+   */
+  ACT.relNoter = function (t) {
+    var items = relItems();
+    if (!items.length) return toast('Coche au moins une ligne', true);
+    if (!confirm('Noter ' + items.length + ' inscription(s) comme relancées aujourd\'hui ? Aucun mail ne part.')) return;
+    busy(t, true);
+    call('noterRelance', { items: items }).then(function (r) {
+      toast(r.n + ' relance(s) notée(s)' + (r.erreurs.length ? ', ' + r.erreurs.length + ' erreur(s)' : ''), !!r.erreurs.length);
+      go('mails');
+    }).catch(function (err) { busy(t, false); fail(err); });
+  };
+  ACT.relGo = function (t) {
+    var items = relItems();
+    if (!items.length) return toast('Coche au moins une ligne', true);
+    busy(t, true);
+    call('brouillonsRelance', { items: items }).then(function (r) { toast(r.crees + ' brouillon(s) créé(s)' + (r.erreurs.length ? ', ' + r.erreurs.length + ' erreur(s)' : ''), !!r.erreurs.length); go('mails'); }).catch(function (err) { busy(t, false); fail(err); });
+  };
+
+  // ---------- Comm : envoyer des images depuis le téléphone, la tablette ou l'ordi ----------
+  ACT.ajoutImages = function () {
+    openDrawer('Ajouter des images', '<form id="fUp"><div class="field"><label>Dossier</label><select name="dossier"><option>Chargement…</option></select></div>' +
+      '<label class="upzone"><input type="file" name="files" accept="image/*,application/pdf,video/*" multiple hidden><b>' + ICON.plus + ' Choisir des photos</b><span class="muted small">Sur téléphone : galerie ou appareil photo. Plusieurs à la fois possible.</span></label>' +
+      '<div id="upList" class="up-list"></div><button class="btn primary big" type="submit" style="width:100%" disabled>Envoyer dans le Drive</button></form>');
+    var f = $('#fUp'), fichiers = [];
+    call('mediasDossiers').then(function (ds) {
+      f.dossier.innerHTML = ds.map(function (d, i) { return '<option value="' + esc(d.id) + '"' + (i === 0 ? ' selected' : '') + '>' + esc(d.nom) + '</option>'; }).join('');
+    }).catch(fail);
+    f.files.addEventListener('change', function () {
+      fichiers = Array.prototype.slice.call(f.files.files);
+      $('#upList').innerHTML = fichiers.map(function (x, i) {
+        return '<div class="up-item" id="up' + i + '">' + (/^image\//.test(x.type) ? '<img alt="" src="' + URL.createObjectURL(x) + '">' : '<span class="b">' + esc(x.type.split('/')[1] || 'fichier') + '</span>') +
+          '<div class="main"><div class="t">' + esc(x.name) + '</div><div class="s">' + (x.size / 1048576).toFixed(1) + ' Mo</div></div><span class="st muted small">prêt</span></div>';
+      }).join('');
+      f.querySelector('button[type=submit]').disabled = !fichiers.length;
+    });
+    f.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var btn = f.querySelector('button[type=submit]'); busy(btn, true);
+      var ok = 0, i = 0;
+      function suivant() {
+        if (i >= fichiers.length) {
+          busy(btn, false); btn.textContent = ok + ' / ' + fichiers.length + ' envoyé(s)';
+          toast(ok + ' fichier(s) ajouté(s) dans le Drive');
+          var gen = S.gen;
+          call('rafraichirMedias').then(function () { if (S.view === 'comm' && S.gen === gen) VIEWS.comm($('#view')); }).catch(function () { });
+          return;
+        }
+        var k = i++, x = fichiers[k], st = $('#up' + k + ' .st');
+        st.textContent = 'envoi…';
+        preparer(x).then(function (b) {
+          return call('uploadMedia', { name: b.name, mime: b.mime, data: b.data, dossier: f.dossier.value });
+        }).then(function () { ok++; st.textContent = '✓'; st.style.color = 'var(--green)'; })
+          .catch(function (e) { st.textContent = 'erreur'; st.style.color = 'var(--red)'; st.title = e.message; })
+          .then(suivant);
+      }
+      suivant();
+    });
+  };
+  // fichier -> base64 ; une photo de plus de 12 Mo est réduite (4000 px, JPEG 90 %) pour passer vite
+  function preparer(file) {
+    function lire(blob) {
+      return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(String(r.result).split(',')[1]); }; r.onerror = rej; r.readAsDataURL(blob); });
+    }
+    if (!/^image\/(jpeg|png|webp)/.test(file.type) || file.size <= 12 * 1048576) return lire(file).then(function (d) { return { name: file.name, mime: file.type || 'application/octet-stream', data: d }; });
+    return new Promise(function (res) {
+      var img = new Image();
+      img.onload = function () {
+        var sc = Math.min(1, 4000 / Math.max(img.width, img.height));
+        var c = document.createElement('canvas'); c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        c.toBlob(function (b) { lire(b).then(function (d) { res({ name: file.name.replace(/\.\w+$/, '') + '.jpg', mime: 'image/jpeg', data: d }); }); }, 'image/jpeg', 0.9);
+      };
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  // ---------- Comm (médiathèque) ----------
+  VIEWS.comm = function (el, param) {
+    var force = param && param.refresh;
+    return call(force ? 'rafraichirMedias' : 'medias').then(function (list) {
+      S.data.medias = list;
+      S.data.mediaFilter = S.data.mediaFilter || 'image';
+      el.innerHTML = '<div class="page-head"><div><h1>Comm</h1><p>Photos et affiches du dossier Comm > Photo & Affiche du Drive</p></div><div class="actions"><button class="btn primary" data-act="ajoutImages">' + ICON.plus + 'Ajouter des images</button><button class="btn" data-go="comm" data-param="' + P({ refresh: 1 }) + '">Rafraîchir</button></div></div>' +
+        '<div class="search">' + ICON.search + '<input id="mq" type="search" placeholder="Chercher : logo, stage, story, reel..."></div>' +
+        '<div class="chips" id="mchips">' + [['tout', 'Tout'], ['image', 'Images'], ['texte', 'Textes / plans'], ['pdf', 'PDF'], ['video', 'Vidéos']].map(function (c) {
+          return '<button class="chip' + (S.data.mediaFilter === c[0] ? ' on' : '') + '" data-act="mfilter" data-f="' + c[0] + '">' + c[1] + '</button>';
+        }).join('') + '</div><div id="mgrid"></div>';
+      $('#mq').addEventListener('input', renderMedias);
+      renderMedias();
+    });
+  };
+  ACT.mfilter = function (t) { S.data.mediaFilter = t.dataset.f; $all('#mchips .chip').forEach(function (c) { c.classList.toggle('on', c === t); }); renderMedias(); };
+  var thumbQueue = [], thumbBusy = 0, thumbObs = null;
+  function renderMedias() {
+    var q = ($('#mq').value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    var f = S.data.mediaFilter;
+    var list = S.data.medias.filter(function (m) {
+      if (f !== 'tout' && m.type !== f) return false;
+      if (!q) return true;
+      return (m.nom + ' ' + m.dossier).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').indexOf(q) >= 0;
+    }).slice(0, 200);
+    var sym = { texte: 'Aa', pdf: 'PDF', video: '▶', autre: '•' };
+    $('#mgrid').innerHTML = list.length ? '<div class="media-grid">' + list.map(function (m) {
+      return '<div class="media" data-act="media" data-id="' + esc(m.id) + '"><div class="th" data-thumb="' + (m.type === 'image' ? esc(m.id) : '') + '">' + (m.type === 'image' ? '' : esc(sym[m.type] || '•')) + '</div><div class="cap"><b>' + esc(m.nom) + '</b><span class="muted">' + esc(m.dossier.split(' / ').slice(-1)[0]) + ' · ' + esc(m.date) + '</span></div></div>';
+    }).join('') + '</div>' : '<div class="empty">Rien trouvé.</div>';
+    thumbQueue = [];
+    if (thumbObs) thumbObs.disconnect();
+    thumbObs = 'IntersectionObserver' in window ? new IntersectionObserver(function (ents) {
+      ents.forEach(function (en) { if (en.isIntersecting) { thumbObs.unobserve(en.target); queueThumb(en.target); } });
+    }, { rootMargin: '200px' }) : null;
+    $all('[data-thumb]').forEach(function (n) { if (n.dataset.thumb) { if (thumbObs) thumbObs.observe(n); else queueThumb(n); } });
+  }
+  var thumbCache = {};
+  function queueThumb(node) { thumbQueue.push(node); pumpThumbs(); }
+  function pumpThumbs() {
+    while (thumbBusy < 4 && thumbQueue.length) {
+      var node = thumbQueue.shift(), id = node.dataset.thumb;
+      if (thumbCache[id]) { node.style.backgroundImage = 'url("' + thumbCache[id] + '")'; continue; }
+      thumbBusy++;
+      (function (node, id) {
+        call('miniature', { id: id }).then(function (data) {
+          data = safeImg(data);
+          if (data) { thumbCache[id] = data; node.style.backgroundImage = 'url("' + data + '")'; } else node.textContent = '🖼';
+        }).catch(function () { node.textContent = '🖼'; }).then(function () { thumbBusy--; pumpThumbs(); });
+      })(node, id);
+    }
+  }
+  ACT.media = function (t) {
+    var m = S.data.medias.filter(function (x) { return x.id === t.dataset.id; })[0];
+    if (!m) return;
+    if (m.type === 'texte') {
+      openDrawer(m.nom, '<div class="loader"><span></span></div>');
+      call('texteDoc', { id: m.id }).then(function (d) {
+        S.data.texte = d.texte;
+        drawerBody('<div class="actions" style="margin-bottom:12px"><button class="btn primary" data-act="copyTexte">Copier le texte</button><a class="btn" href="' + esc(safeUrl(d.url)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Ouvrir le Doc</a></div><pre class="mail">' + esc(d.texte) + '</pre>');
+      }).catch(fail);
+      return;
+    }
+    var img = thumbCache[m.id];
+    openDrawer(m.nom, (img ? '<img src="' + img + '" alt="" style="width:100%;border-radius:12px;background:#fff;border:1px solid var(--line)">' : '') +
+      '<p class="muted small">' + esc(m.dossier) + ' · modifié le ' + esc(m.date) + '</p><div class="actions"><a class="btn primary" href="' + esc(safeUrl(m.url)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Ouvrir dans Drive (télécharger)</a></div>');
+  };
+  ACT.copyTexte = function () {
+    var txt = S.data.texte || '';
+    (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(function () { toast('Texte copié'); }).catch(function () {
+      var ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select();
+      var ok = false; try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      toast(ok ? 'Texte copié' : 'Copie impossible, sélectionne le texte à la main', !ok);
+      ta.remove();
+    });
+  };
+
+  // ---------- Notes site ----------
+  VIEWS.site = function (el, param) {
+    return swr('notesSite', function (list) {
+      S.data.notes = list;
+      var f = (param && param.f) || 'ouvert';
+      var shown = list.filter(function (n) { return f === 'tout' ? true : (f === 'fait' ? n.Statut === 'Fait' : n.Statut !== 'Fait'); });
+      var h = '<div class="page-head"><div><h1>Notes site web</h1><p>Mises à jour à faire sur le site public</p></div><div class="actions"><a class="btn" href="https://example.org" target="_blank" rel="noopener">' + ICON.ext + 'Voir le site</a><button class="btn primary" data-act="newNote">' + ICON.plus + 'Note</button></div></div>';
+      h += '<div class="chips">' + [['ouvert', 'À faire / en cours'], ['fait', 'Faites'], ['tout', 'Toutes']].map(function (c) {
+        return '<button class="chip' + (f === c[0] ? ' on' : '') + '" data-go="site" data-param="' + P({ f: c[0] }) + '">' + c[1] + '</button>';
+      }).join('') + '</div>';
+      h += '<div class="card">' + (shown.length ? '<div class="list">' + shown.map(function (n) {
+        var pc = { Haute: 'red', Normale: '', Basse: 'blue' }[n.Priorite] || '';
+        var sc = { 'À faire': 'yellow', 'En cours': 'blue', 'Fait': 'green' }[n.Statut] || '';
+        return '<div class="li notes"><div class="main"><div class="t">' + esc(n.Description) + '</div><div class="s">' + esc([n.Page, n.Date, n.Auteur].filter(Boolean).join(' · ')) + '</div></div>' +
+          '<span class="b ' + pc + '">' + esc(n.Priorite) + '</span><span class="b ' + sc + '">' + esc(n.Statut) + '</span>' +
+          '<div class="nact">' + (n.Statut === 'Fait' ? '<button class="btn sm ghost" data-act="noteFait" data-id="' + esc(n.ID) + '" data-s="À faire">Rouvrir</button>'
+            : '<button class="btn sm primary" data-act="noteFait" data-id="' + esc(n.ID) + '" data-s="Fait">' + ICON.check + 'Fait</button>') +
+          '<button class="btn sm ghost" data-act="noteEdit" data-id="' + esc(n.ID) + '">✎</button><button class="btn sm ghost danger" data-act="noteDel" data-id="' + esc(n.ID) + '">✕</button></div></div>';
+      }).join('') + '</div>' : '<div class="empty">Aucune note.</div>') + '</div>';
+      el.innerHTML = h;
+    });
+  };
+  function noteForm(n) {
+    n = n || {};
+    return '<form id="fNote"><div class="field"><label>Page / section</label><input name="Page" value="' + esc(n.Page || '') + '" placeholder="Accueil, Planning, Stages, Tarifs..."></div>' +
+      '<div class="field"><label>Ce qu\'il faut changer</label><textarea name="Description" required>' + esc(n.Description || '') + '</textarea></div>' +
+      '<div class="row"><div class="field"><label>Priorité</label><select name="Priorite">' + ['Haute', 'Normale', 'Basse'].map(function (o) { return '<option' + ((n.Priorite || 'Normale') === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select></div>' +
+      '<div class="field"><label>Statut</label><select name="Statut">' + ['À faire', 'En cours', 'Fait'].map(function (o) { return '<option' + ((n.Statut || 'À faire') === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select></div>' +
+      '<div class="field"><label>Qui</label><input name="Auteur" value="' + esc(n.Auteur || '') + '" placeholder="Dominique"></div></div>' +
+      '<input type="hidden" name="ID" value="' + esc(n.ID || '') + '"><input type="hidden" name="Date" value="' + esc(n.Date || '') + '"><button class="btn primary" type="submit">Enregistrer</button></form>';
+  }
+  function bindNote() {
+    $('#fNote').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var f = ev.target, o = {}; $all('[name]', f).forEach(function (i) { o[i.name] = i.value; });
+      var btn = $('button[type=submit]', f); busy(btn, true);
+      call('saveNoteSite', o).then(function () { toast('Note enregistrée'); closeDrawer(); go('site', S.param); }).catch(function (err) { busy(btn, false); fail(err); });
+    });
+  }
+  ACT.newNote = function () { openDrawer('Nouvelle note site', noteForm()); bindNote(); };
+  ACT.noteEdit = function (t) { var n = S.data.notes.filter(function (x) { return String(x.ID) === t.dataset.id; })[0]; openDrawer('Modifier la note', noteForm(n)); bindNote(); };
+  ACT.noteFait = function (t) {
+    busy(t, true);
+    call('statutNoteSite', { ID: t.dataset.id, Statut: t.dataset.s }).then(function (st) { toast(st === 'Fait' ? 'Tâche faite' : 'Tâche rouverte'); go('site', S.param); }).catch(function (e) { busy(t, false); fail(e); });
+  };
+  ACT.noteDel = function (t) { if (!confirm('Supprimer cette note ?')) return; call('deleteNoteSite', { ID: t.dataset.id }).then(function () { go('site', S.param); }).catch(fail); };
+
+  // ---------- Docs & rapports ----------
+  VIEWS.docs = function (el) {
+    return Promise.all([call('docs'), call('rapports')]).then(function (r) {
+      var d = r[0], rap = r[1];
+      var h = '<div class="page-head"><div><h1>Docs & rapports</h1><p>Les fichiers qu\'on utilise tout le temps + les rapports de Claude (veille matos, tri des mails)</p></div></div>';
+      h += '<div class="grid g2" style="align-items:start"><div class="card"><h3>' + ICON.docs + 'Fichiers clés</h3><div class="list">' + d.fixes.map(function (f) {
+        return '<a class="li click" href="' + esc(safeUrl(f.url)) + '" target="_blank" rel="noopener" style="text-decoration:none;color:inherit"><div class="main"><div class="t">' + esc(f.nom) + '</div></div>' + ICON.ext + '</a>';
+      }).join('') + '</div><div class="hr"></div><h3>Dossier admin</h3><div class="list">' + (d.admin.map(function (f) {
+        return '<a class="li click" href="' + esc(safeUrl(f.url)) + '" target="_blank" rel="noopener" style="text-decoration:none;color:inherit"><div class="main"><div class="t">' + esc(f.nom) + '</div><div class="s">' + esc(f.date) + '</div></div>' + ICON.ext + '</a>';
+      }).join('') || '<div class="muted">Vide.</div>') + '</div></div>';
+      h += '<div class="card"><h3>Rapports Claude</h3>' + (rap.length ? '<div class="list">' + rap.map(function (f) {
+        return '<div class="li click" data-act="rapport" data-id="' + esc(f.id) + '" data-mime="' + esc(f.mime) + '" data-url="' + esc(f.url) + '" data-nom="' + esc(f.nom) + '"><span class="b ' + (f.type === 'Veille matos' ? 'yellow' : 'blue') + '">' + esc(f.type) + '</span><div class="main"><div class="t">' + esc(f.nom) + '</div><div class="s">' + esc(f.date) + '</div></div></div>';
+      }).join('') + '</div>' : '<div class="muted">Pas encore de rapport. Les tâches planifiées de Claude déposent ici la veille matériel et le tri des mails.</div>') + '</div></div>';
+      el.innerHTML = h;
+    });
+  };
+  ACT.rapport = function (t) {
+    if (t.dataset.mime !== 'application/vnd.google-apps.document') { window.open(t.dataset.url, '_blank', 'noopener'); return; }
+    openDrawer(t.dataset.nom, '<div class="loader"><span></span></div>');
+    call('texteDoc', { id: t.dataset.id }).then(function (d) {
+      drawerBody('<div class="actions" style="margin-bottom:12px"><a class="btn" href="' + esc(safeUrl(d.url)) + '" target="_blank" rel="noopener">' + ICON.ext + 'Ouvrir le Doc</a></div><pre class="mail">' + esc(d.texte) + '</pre>');
+    }).catch(fail);
+  };
+
+  VIEWS.accueil = function (el) { return accueilView(el); };
+
+  // ================= démarrage =================
+  renderNav();
+  (window.__INFO && window.__INFO.nom ? Promise.resolve(window.__INFO) : call('info')).then(function (i) {
+    var logo = safeImg(i.logo);
+    if (logo) {
+      S.logo = logo;
+      $all('.brand-dot').forEach(function (n) {
+        var img = document.createElement('img');
+        img.src = logo; img.alt = i.nom; img.className = 'logo' + (n.classList.contains('big') ? ' big' : '');
+        n.replaceWith(img);
+      });
+    }
+    $('#sideFoot').innerHTML = esc(i.nom) + (i.tel ? '<br>Urgences : <a href="tel:' + esc(String(i.tel).replace(/\s/g, '')) + '" style="color:var(--yellow)">' + esc(i.tel) + '</a>' : '') +
+      '<br><button class="btn sm ghost" style="color:#e9dfcf;border-color:#3a3232;margin-top:8px" data-act="refresh">Actualiser</button> <button class="btn sm ghost" style="color:#e9dfcf;border-color:#3a3232;margin-top:8px" data-act="lock">Verrouiller</button>';
+    if (!i.pinConfigure) { noPin('Aucun code PIN (4 caractères minimum) dans l\'onglet Config du classeur ERP. Ajoute-le puis recharge la page.'); return; }
+    if (!S.pin) { showPin(''); return; }
+    chargerTout().then(function () { if ($('#pinScreen').hidden) go('accueil'); });
+  }).catch(function (e) { $('#view').innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; });
+})();
+</script>

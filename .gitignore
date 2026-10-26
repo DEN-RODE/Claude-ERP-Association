@@ -1,0 +1,13 @@
+node_modules/
+.clasp.json
+.claspignore
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Ne jamais versionner une configuration remplie avec les donnees d'une structure.
+# La configuration vit dans l'onglet Config du classeur, pas dans le code.
+src/Config.local.gs
+config.local.*
+*.secret.*
