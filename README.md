@@ -1,5 +1,12 @@
 # ERP Association
 
+[![tests](https://github.com/DEN-RODE/Claude-ERP-Association/actions/workflows/tests.yml/badge.svg)](https://github.com/DEN-RODE/Claude-ERP-Association/actions/workflows/tests.yml)
+![version](https://img.shields.io/badge/version-2.0.0-6f42c1)
+![Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-4285F4?logo=google&logoColor=white)
+![dépendances](https://img.shields.io/badge/d%C3%A9pendances-0-brightgreen)
+![tests](https://img.shields.io/badge/tests-251-brightgreen)
+[![licence MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
+
 ERP de gestion pour une petite association qui fait de l'accueil de public : inscriptions, paiements, présences, facturation, prévisionnel. Il tourne entièrement sur Google Workspace, sans serveur, sans base de données et sans coût d'hébergement.
 
 Il est né d'un besoin réel, dans une association de quatre personnes dont aucune n'a de temps pour de la saisie administrative. Il a été généralisé ici pour que d'autres structures puissent le reprendre : une école de musique, un club sportif, une MJC, une école de cirque, un atelier d'arts plastiques. Le vocabulaire affiché (adhérent, cours, stage, lieu) se change dans une feuille de calcul, sans toucher au code.
@@ -157,6 +164,10 @@ Ce qui manque et que je sais :
 - `ModeleEco.gs` écrit des formules dans un classeur tiers. C'est la partie la plus fragile et la moins testée, parce qu'elle dépend de la mise en page de ce classeur.
 
 Les retours et les forks sont bienvenus, en particulier venant d'une structure dont le vocabulaire ne rentre pas dans la table ci-dessus.
+
+## Historique
+
+Voir [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Licence
 
